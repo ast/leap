@@ -2,6 +2,7 @@
 //!
 //! See `docs/DESIGN.md` for the architecture and milestone plan.
 
+mod buffer;
 mod editor;
 mod terminal;
 
