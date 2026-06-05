@@ -3,8 +3,14 @@
 //! See `docs/DESIGN.md` for the architecture and milestone plan.
 
 mod buffer;
+mod echo;
 mod editor;
+mod finder;
+mod hold;
+mod leap;
+mod statusline;
 mod terminal;
+mod walk;
 
 use std::path::PathBuf;
 
@@ -34,7 +40,7 @@ fn main() -> Result<()> {
 
     // Hold the terminal guard for the whole session; dropping it (normal exit,
     // `?` error, or panic) restores the terminal.
-    let _guard = terminal::setup()?;
-    let mut editor = Editor::open(cli.file, cli.line, cli.readonly)?;
+    let guard = terminal::setup()?;
+    let mut editor = Editor::open(cli.file, cli.line, cli.readonly, guard.kbd_enhanced())?;
     editor.run()
 }

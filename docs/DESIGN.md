@@ -15,7 +15,8 @@ portable as a static musl binary.
 | Navigation | **Cat incremental LEAP** — type characters and the cursor flies to the next/previous occurrence live. |
 | Selection | **Cat LEAP-span** — leap to one end, leap-with-select to the other; the span between becomes the selection. |
 | Undo | **Linear undo/redo with grouping** — consecutive typing/deletes coalesce into one step. |
-| Commands | **Minibuffer command palette** — bottom-line prompt for file paths, named commands, search/replace. |
+| Confirmations | **No modal yes/no dialogs** (Raskin). Destructive actions use a **hold-to-confirm gesture** (`src/hold.rs`): sustained key pressure + meter, abortable by release. Quit discards via **hold `C-q`**. Kitty-protocol release events with a repeat-timeout fallback. |
+| File open/save | **fzf-style finder overlay** (`src/finder.rs`, `src/walk.rs`) — no modal minibuffer. A visible, escapable transient context: gitignore-aware walk from repo-root, nucleo fuzzy-match, type-to-narrow. Save mode = typed query is the path. Goto-line dropped (LEAP supersedes). |
 | Concurrency | Async syntax highlighting, async file I/O, background search; instant startup. |
 | Languages | tree-sitter grammars bundled: **Rust, C, C++, TOML, JSON, YAML, Markdown**. |
 | Primary target | **x86_64-unknown-linux-musl** (static). Keep code portable so FreeBSD stays compilable. |
@@ -28,15 +29,17 @@ portable as a static musl binary.
 │ …                                        │
 │ …                                        │
 ├─────────────────────────────────────────┤  ← status line (filename ● | lang | ln:col | %)
-│ minibuffer / echo area                   │  ← prompts, LEAP query, messages
+│ echo line (display-only)                 │  ← transient messages, hold meter
 └─────────────────────────────────────────┘
 ```
 
 - **Status line** (Cat ruler / Emacs mode line): file name + modified dot, language,
   cursor `line:col`, char offset / `%` through file, selection size, encoding/EOL,
   and a LEAP-active indicator.
-- **Minibuffer / echo area** (bottom-most line): command palette input, LEAP query
-  display (`LEAP→ foo`), search/replace, and transient messages.
+- **Echo line** (bottom-most, `src/echo.rs`): **display-only** — transient messages
+  (Saved, read-only) and the hold-`C-q` meter. Never an input prompt (no modal
+  minibuffer — Raskin). File open/save happens in the fzf finder overlay; LEAP
+  query displays in the LEAP context.
 
 ## Architecture
 
@@ -67,12 +70,13 @@ main thread ──┬── crossterm event read → keymap → command dispatch
   - `cursor.rs` — position + LEAP-span selection + coordinate conversion.
 - `leap.rs` — incremental LEAP engine (forward/back, creep), drives background search.
 - `view.rs` — viewport, scrolling, buffer-coords → screen-cells, unicode width.
-- `render.rs` — crossterm drawing of text area, status line, minibuffer.
+- `render.rs` — crossterm drawing of text area, status line, echo line.
 - `syntax.rs` — tree-sitter parse + highlight, background worker, snapshot-based.
 - `theme.rs` — compile-time `Theme` structs; built-ins; tree-sitter capture → color.
 - `keymap.rs` — compile-time key → `Command` table; modeless dispatch.
 - `command.rs` — `Command` enum + execution.
-- `minibuffer.rs` — bottom-line prompt state (paths, commands, search input).
+- `echo.rs` — display-only bottom message line (no input mode).
+- `finder.rs` + `walk.rs` — fzf-style file open/save overlay over a gitignore-aware walk.
 - `statusline.rs` — status line model + formatting.
 - `fileio.rs` — async load/save; atomic save (temp + rename); EOL/UTF-8 detection.
 - `clipboard.rs` — internal kill buffer + OS clipboard via **OSC 52** (no X deps;
@@ -137,12 +141,12 @@ hidden `completions <shell>` subcommand (clap_complete).
 
 1. **Skeleton** — raw mode + alt screen, event loop, draw empty buffer, quit; clap file arg.
 2. **Buffer + view** — rope insert/delete, cursor movement, viewport scrolling, render.
-3. **Chrome** — status line + minibuffer/echo area.
+3. **Chrome** — status line + display-only echo line.
 4. **Files** — open/save (sync), atomic save, modified flag, EOL/UTF-8 handling.
-5. **LEAP** — incremental LEAP session navigation (the core feature).
+5. **LEAP** — incremental LEAP session navigation (`C-s`/`C-r`, lands at match start, wraps). ✓ done.
 6. **Selection + clipboard** — LEAP-span selection, cut/copy/paste, kill buffer + OSC 52.
 7. **Undo/redo** — linear stack with coalescing.
-8. **Command palette** — minibuffer commands (open, save-as, set-language, replace).
+8. **fzf finder** — file open/save overlay (replaces the minibuffer prompts).
 9. **Highlighting** — tree-sitter, sync first.
 10. **Concurrency** — move highlighting, search, and I/O to workers; version tagging.
 11. **Themes** — compile-time `Theme` + cargo features.
