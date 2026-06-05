@@ -1,0 +1,5 @@
+/target
+
+# Canon Cat reference manuals (~270 MB) — fetched locally, not committed.
+# See docs/README.md for the source URLs to re-download.
+/docs/*.pdf
