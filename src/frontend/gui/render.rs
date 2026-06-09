@@ -171,6 +171,8 @@ pub struct Gpu {
     metrics: Metrics,
     cell: CellMetrics,
     scale: f32,
+    /// The device's max 2D texture dimension; surfaces are clamped to it.
+    max_dim: u32,
     /// Resolved font family name, or `None` for the generic monospace fallback.
     font_family: Option<String>,
     /// Base (unscaled) point size.
@@ -210,12 +212,23 @@ impl Gpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("leap-gui device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            // The adapter's real limits — downlevel_defaults caps textures at
+            // 2048, which a fullscreen surface (e.g. 2560×1440) exceeds. The
+            // adapter's own limits are always satisfiable and report the true max
+            // texture size; this still works under the GL fallback.
+            required_limits: adapter.limits(),
             ..Default::default()
         }))?;
+        // Clamp the surface to the device's max texture size — a display larger
+        // than the GPU's max would otherwise panic on configure.
+        let max_dim = device.limits().max_texture_dimension_2d;
 
         let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .get_default_config(
+                &adapter,
+                size.width.clamp(1, max_dim),
+                size.height.clamp(1, max_dim),
+            )
             .ok_or_else(|| anyhow!("surface not supported by the adapter"))?;
         // Prefer an sRGB surface: glyphon blends glyph coverage gamma-correctly
         // (ColorMode::Accurate) assuming an sRGB target, and our clear/quad colors
@@ -272,6 +285,7 @@ impl Gpu {
             metrics,
             cell,
             scale,
+            max_dim,
             font_family,
             base_size,
             last_body: String::new(),
@@ -293,10 +307,11 @@ impl Gpu {
             .set_monospace_width(&mut self.font_system, Some(self.cell.advance));
     }
 
-    /// Reconfigure the surface after a window resize.
+    /// Reconfigure the surface after a window resize (clamped to the GPU's max
+    /// texture size).
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.config.width = width.max(1);
-        self.config.height = height.max(1);
+        self.config.width = width.clamp(1, self.max_dim);
+        self.config.height = height.clamp(1, self.max_dim);
         self.surface.configure(&self.device, &self.config);
     }
 
