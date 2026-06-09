@@ -35,8 +35,6 @@ pub struct FrameMeta {
     pub echo: String,
     /// Cursor `(col, row)` in cells, viewport-relative.
     pub cursor: (usize, usize),
-    /// LEAP match `(row, start_col, end_col)`, viewport-relative.
-    pub leap_hl: Option<(usize, usize, usize)>,
     pub full_repaint: bool,
     pub redraw_text: bool,
 }
@@ -52,9 +50,9 @@ pub struct Frame {
     pub echo: String,
     /// Cursor position in cells, viewport-relative: `(col, row)`.
     pub cursor: (usize, usize),
-    /// LEAP match highlight, viewport-relative: `(row, start_col, end_col)` in
-    /// visible cells. `None` when not leaping / off-screen / no match.
-    pub leap_hl: Option<(usize, usize, usize)>,
+    /// Per-text-row inverse highlight (selection or LEAP match): one entry per
+    /// row, each an optional `(start_col, end_col)` span in visible cells.
+    pub highlights: Vec<Option<(usize, usize)>>,
     /// The whole surface should be cleared and repainted (recenter / LEAP
     /// land/cancel / first frame). Front-ends that always repaint can ignore it.
     pub full_repaint: bool,

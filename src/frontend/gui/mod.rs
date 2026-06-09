@@ -24,7 +24,7 @@ use winit::window::{Window, WindowId};
 use crate::editor::Editor;
 use crate::input::{KeyChord, LogicalKey};
 use crate::view::Row;
-use render::{Gpu, LeapDraw, RenderStats, Scene};
+use render::{Gpu, HighlightSpan, RenderStats, Scene};
 
 /// Frame-time instrumentation, enabled by setting the `LEAP_PERF` env var.
 /// Prints a summary every 120 rendered frames and on exit.
@@ -255,25 +255,32 @@ impl App {
         // Solid erase highlight on the character to the left — only in the Cat's
         // "wide" (just-typed) state, and not at the start of a line. After a
         // move/leap the cursor is "narrow": a single blinking block.
-        let highlight = (self.editor.cursor_wide() && cursor_col > 0)
+        // The wide single-cell highlight only shows in the typed "wide" state and
+        // when no span selection is active (the selection supersedes it).
+        let highlight = (self.editor.cursor_wide()
+            && !self.editor.selection_active()
+            && cursor_col > 0)
             .then(|| (((cursor_col - 1) as f32 * adv, cursor_y), glyph_at(cursor_col - 1)));
         let cursor_visible = blink_visible(self.blink_epoch, now);
         self.blink_drawn = cursor_visible;
 
-        // LEAP highlight placed in the animated window.
-        let leap = meta.leap_hl.map(|(rel, s, e)| {
-            let line = top + rel;
-            let matched: String = match body.get(line.saturating_sub(first)) {
-                Some(Row::Text(t)) => t.chars().skip(s).take(e.saturating_sub(s)).collect(),
-                _ => String::new(),
-            };
-            (
-                s as f32 * adv,
-                line as f32 * lh - scroll_px,
-                e.saturating_sub(s) as f32 * adv,
-                matched,
-            )
-        });
+        // Inverse highlight spans (selection — possibly multi-row — or a LEAP
+        // match), one per highlighted row in the animated window.
+        let mut span_data: Vec<(f32, f32, f32, String)> = Vec::new();
+        for (i, row) in body.iter().enumerate() {
+            if let Some((a, b)) = self.editor.row_highlight(first + i, left, cols) {
+                let text = match row {
+                    Row::Text(t) => t.chars().skip(a).take(b - a).collect::<String>(),
+                    _ => String::new(),
+                };
+                let y = (first + i) as f32 * lh - scroll_px;
+                span_data.push((a as f32 * adv, y, (b - a) as f32 * adv, text));
+            }
+        }
+        let spans: Vec<HighlightSpan> = span_data
+            .iter()
+            .map(|(x, y, w, t)| HighlightSpan { x: *x, y: *y, width: *w, text: t })
+            .collect();
 
         let scene = Scene {
             rows: &body,
@@ -286,12 +293,7 @@ impl App {
             cursor_visible,
             highlight_px: highlight.as_ref().map(|(px, _)| *px),
             highlight_glyph: highlight.as_ref().and_then(|(_, g)| g.as_deref()),
-            leap: leap.as_ref().map(|(x, y, w, m)| LeapDraw {
-                x: *x,
-                y: *y,
-                width: *w,
-                matched: m,
-            }),
+            spans: &spans,
             preedit: &self.preedit,
         };
         match gpu.render(&scene) {

@@ -130,11 +130,11 @@ impl Tui {
                 Row::MarkerRule => marker_rule(text_cols),
                 Row::Tilde => "~".to_string(),
             };
-            match frame.leap_hl {
-                Some((hl_row, lo, hi)) if hl_row == row => {
+            match frame.highlights.get(row).copied().flatten() {
+                Some((lo, hi)) => {
                     self.draw_row_highlight(&mut out, row as u16, &desired, lo, hi, text_cols)?;
                 }
-                _ => self.draw_row(&mut out, row as u16, desired, text_cols, false)?,
+                None => self.draw_row(&mut out, row as u16, desired, text_cols, false)?,
             }
         }
 

@@ -47,20 +47,24 @@ pub struct Scene<'a> {
     pub cursor_glyph: Option<&'a str>,
     pub cursor_visible: bool,
     /// …and the **solid** erase highlight on the character left of the cursor
-    /// (what Backspace removes). `None` at the start of a line.
+    /// (what Backspace removes). `None` at the start of a line, or while a span
+    /// selection is active.
     pub highlight_px: Option<(f32, f32)>,
     pub highlight_glyph: Option<&'a str>,
-    pub leap: Option<LeapDraw<'a>>,
+    /// Inverse highlight spans (the selection — possibly multi-row — or a LEAP
+    /// match), one per highlighted visible row.
+    pub spans: &'a [HighlightSpan<'a>],
     /// In-progress IME composition, shown inline at the cursor.
     pub preedit: &'a str,
 }
 
-/// A LEAP match highlight, in pixels.
-pub struct LeapDraw<'a> {
+/// One inverse-highlight span (selection row or LEAP match), in pixels. `text`
+/// is the highlighted substring, re-drawn in paper over the ink rectangle.
+pub struct HighlightSpan<'a> {
     pub x: f32,
     pub y: f32,
     pub width: f32,
-    pub matched: &'a str,
+    pub text: &'a str,
 }
 
 // --- Canon Cat palette (compile-time) ------------------------------------
@@ -128,8 +132,9 @@ struct QuadVertex {
 const QUAD_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
 
-/// Max quads we ever draw in a frame (status bar + LEAP rect + cursor ≈ 3).
-const QUAD_CAPACITY: usize = 64;
+/// Max quads we ever draw in a frame (status bar + cursor + one per highlighted
+/// row for a full-screen selection).
+const QUAD_CAPACITY: usize = 256;
 
 /// Append a pixel-space rectangle (two triangles) to `verts`. `rect` is
 /// `[x0, y0, x1, y1]` in pixels; `screen` is `[width, height]` in pixels.
@@ -371,12 +376,12 @@ impl Gpu {
             reshaped = true;
         }
 
-        // Inverse ink rectangles: status bar, LEAP match, cursor block.
+        // Inverse ink rectangles: status bar, highlight spans, cursor block.
         let ink_lin = linear(INK);
         let mut quads: Vec<QuadVertex> = Vec::with_capacity(QUAD_CAPACITY * 6);
         push_rect(&mut quads, [0.0, text_rows as f32 * lh, w, (text_rows as f32 + 1.0) * lh], screen, ink_lin);
-        if let Some(l) = &scene.leap {
-            push_rect(&mut quads, [l.x, l.y, l.x + l.width, l.y + lh], screen, ink_lin);
+        for s in scene.spans {
+            push_rect(&mut quads, [s.x, s.y, s.x + s.width, s.y + lh], screen, ink_lin);
         }
         let (cur_x, cur_y) = scene.cursor_px;
         if !composing {
@@ -396,11 +401,12 @@ impl Gpu {
         // Paper overlays for the inverse regions.
         let status_buf = self.make_line(scene.status, color(PAPER));
         let echo_buf = self.make_line(scene.echo, color(INK));
-        let leap_buf = scene
-            .leap
-            .as_ref()
-            .filter(|l| !l.matched.is_empty())
-            .map(|l| (self.make_line(l.matched, color(PAPER)), l.x, l.y));
+        let span_bufs: Vec<(Buffer, f32, f32)> = scene
+            .spans
+            .iter()
+            .filter(|s| !s.text.is_empty())
+            .map(|s| (self.make_line(s.text, color(PAPER)), s.x, s.y))
+            .collect();
         let highlight_buf = match (scene.highlight_px, scene.highlight_glyph) {
             (Some((hx, hy)), Some(g)) if !composing => {
                 Some((self.make_line(g, color(PAPER)), hx, hy))
@@ -445,7 +451,7 @@ impl Gpu {
             TextArea { buffer: &status_buf, left: 0.0, top: text_rows as f32 * lh, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] },
             TextArea { buffer: &echo_buf, left: 0.0, top: (text_rows as f32 + 1.0) * lh, scale: 1.0, bounds, default_color: color(INK), custom_glyphs: &[] },
         ];
-        if let Some((buf, left, top)) = &leap_buf {
+        for (buf, left, top) in &span_bufs {
             areas.push(TextArea { buffer: buf, left: *left, top: *top, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] });
         }
         if let Some((buf, left, top)) = &highlight_buf {

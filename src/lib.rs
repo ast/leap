@@ -12,6 +12,7 @@
 //! See `docs/CANON_CAT.md` for the fileless, database-backed design.
 
 pub mod buffer;
+pub mod calc;
 pub mod echo;
 pub mod editor;
 pub mod frontend;

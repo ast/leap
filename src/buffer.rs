@@ -34,6 +34,10 @@ pub struct Buffer {
     /// horizontal move or edit.
     goal_col: Option<usize>,
     dirty: bool,
+    /// Selection anchor (the "mark"). The selection is the span between this and
+    /// the cursor; `None` means no selection. Preserved across motion (so moving
+    /// extends the span) and cleared on any edit.
+    anchor: Option<usize>,
     /// Edits applied since the last drain, in apply order, awaiting persistence.
     journal: Vec<EditOp>,
     /// Lazily materialized rope text (`rope.chunks().collect()`), reused across
@@ -52,6 +56,7 @@ impl Buffer {
             rope: Rope::from_str(text),
             goal_col: None,
             dirty: false,
+            anchor: None,
             journal: Vec::new(),
             text_cache: RefCell::new(None),
         }
@@ -91,10 +96,59 @@ impl Buffer {
         self.cursor
     }
 
-    /// Move the cursor to a char index (clamped). Used by LEAP.
+    /// Move the cursor to a char index (clamped). Used by LEAP. Preserves the
+    /// mark, so leaping/moving extends an active selection.
     pub fn set_cursor(&mut self, idx: usize) {
         self.cursor = idx.min(self.rope.len_chars());
         self.goal_col = None;
+    }
+
+    // --- selection (LEAP-span / mark) -----------------------------------
+
+    /// Set the mark at the cursor (begin a selection).
+    pub fn set_mark(&mut self) {
+        self.anchor = Some(self.cursor);
+    }
+
+    /// Drop the mark (no selection).
+    pub fn clear_mark(&mut self) {
+        self.anchor = None;
+    }
+
+    /// The selection as a char range `[start, end)`, or `None` when there's no
+    /// mark or it coincides with the cursor (empty).
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let a = self.anchor?;
+        (a != self.cursor).then(|| (a.min(self.cursor), a.max(self.cursor)))
+    }
+
+    /// The selected text, if any.
+    pub fn selection_text(&self) -> Option<String> {
+        let (s, e) = self.selection()?;
+        Some(self.rope.slice(s..e).chars().collect())
+    }
+
+    /// Delete the selection (if any), leaving the cursor at its start and the
+    /// mark cleared. Returns the removed text.
+    pub fn delete_selection(&mut self) -> Option<String> {
+        let (s, e) = self.selection()?;
+        let removed: String = self.rope.slice(s..e).chars().collect();
+        self.rope.remove(s..e);
+        self.cursor = s;
+        self.journal.push(EditOp::Delete { pos: s, text: removed.clone() });
+        self.on_edit(); // also clears the mark
+        Some(removed)
+    }
+
+    /// Char range `[start, end)` of `line`, excluding the trailing line break.
+    /// Past the last line, returns an empty range at the buffer end (no panic).
+    pub fn line_char_bounds(&self, line: usize) -> (usize, usize) {
+        if line >= self.rope.len_lines() {
+            let n = self.rope.len_chars();
+            return (n, n);
+        }
+        let start = self.rope.line_to_char(line);
+        (start, start + self.line_char_len(line))
     }
 
     /// `(line, display_col)` of an arbitrary char index, tabs expanded — used to
@@ -384,6 +438,34 @@ impl Buffer {
         self.on_edit();
     }
 
+    /// The text of the cursor's line, without the trailing line break (used by Calc).
+    pub fn current_line(&self) -> String {
+        let (line, _) = self.cursor_line_col();
+        let start = self.rope.line_to_char(line);
+        let len = self.line_char_len(line);
+        self.rope.slice(start..start + len).chars().collect()
+    }
+
+    /// Replace the cursor's line (its text, not the trailing break) with `new`,
+    /// leaving the cursor at the end of it (used by Calc).
+    pub fn replace_current_line(&mut self, new: &str) {
+        let (line, _) = self.cursor_line_col();
+        let start = self.rope.line_to_char(line);
+        let end = start + self.line_char_len(line);
+        if end > start {
+            let removed: String = self.rope.slice(start..end).chars().collect();
+            self.rope.remove(start..end);
+            self.journal.push(EditOp::Delete { pos: start, text: removed });
+        }
+        self.rope.insert(start, new);
+        self.journal.push(EditOp::Insert {
+            pos: start,
+            text: new.to_string(),
+        });
+        self.cursor = start + new.chars().count();
+        self.on_edit();
+    }
+
     /// Insert a string at the cursor (used by yank); advances past it.
     pub fn insert_str(&mut self, s: &str) {
         if s.is_empty() {
@@ -442,6 +524,7 @@ impl Buffer {
     fn on_edit(&mut self) {
         self.dirty = true;
         self.goal_col = None;
+        self.anchor = None; // any edit collapses the selection
         self.text_cache.get_mut().take(); // invalidate the materialized-text cache
     }
 

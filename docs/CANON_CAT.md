@@ -91,23 +91,43 @@ branch; the orphaned tail stays on disk (nothing lost) but is off the live chain
 full text as a `snapshot` at `head` and delete edits at/below it that are no
 longer reachable. Keeps replay bounded.
 
-## Build sequence (branch milestones)
+## Build sequence (done)
 
-1. **Store** — `src/store.rs`: schema, `append(ops)`, `resume()` (snapshot +
-   replay), `set_state`, `snapshot()` compaction. Unit-tested over temp/in-memory
-   DBs, no TTY. ✓ done.
-2. **Wire persistence** — `Buffer` journals each edit (`Vec<EditOp>`); `Editor`
-   drains the journal and `append`s per key, and persists cursor/scroll state.
-   Construct the buffer from `Store::resume()`. Drop file I/O + file CLI. Quit is
-   instant (always saved). First run seeds the tutorial (`src/tutorial.rs`).
-   ✓ done.
-3. **Document markers** — the `\x1e` sentinel: `C-x C-n` insert (own line),
-   full-width-rule render, `C-x [` / `C-x ]` jump, LEAP roams the stream. ✓ done
-   (selection-aware deletion of a marker is future work).
-4. **Log-scrub undo/redo** — `C-/` / `C-?` (or `C-x u`) walking the log via the
-   parent chain, with run coalescing; survives restart. ← *next.*
-5. **Polish** — compaction tuning, status line document index / position-in-stream,
-   import/export escape hatch (deferred), tree-sitter highlighting.
+1. **Store** — schema, `append`/`resume`/`set_state`/`snapshot`. ✓
+2. **Wire persistence** — `Buffer` journals edits; `Editor` appends per key +
+   resumes from `Store::resume()`; quit is instant; first run seeds the tutorial. ✓
+3. **Document markers** — `\x1e` sentinel, `M-Enter` insert, `Ctrl+PgUp/PgDn`
+   (or `C-x p`/`n`) jump, full-width-rule render, LEAP roams the stream. ✓
+4. **Front-ends** — UI-agnostic core (`input`/`view`) + crossterm TUI + a
+   **Wayland GUI** (`frontend/gui`: winit + wgpu + glyphon, Canon Cat palette,
+   two-part blinking cursor, smooth scroll, IME, clipboard, JetBrains Mono,
+   `LEAP_PERF` instrumentation). ✓
+
+## Cat-fidelity roadmap (next — interview 2026-06-10)
+
+Locked: do **Calc first**; soft **word-wrap** at the margin; commands via **Emacs
+chords** (no USE-FRONT leader).
+
+1. **Calc** — `src/calc.rs`: a small dependency-free arithmetic evaluator
+   (`+ − * /`, parens, decimals, %). A chord (e.g. `M-=`) evaluates the **current
+   line** and inserts the result (v1 needs no selection); becomes selection-aware
+   in M2. The Cat's beloved inline calculator.
+2. **LEAP-span selection + Erase** — `Buffer` gains a selection anchor; leap/motion
+   *with select* extends the span; the span renders as the solid highlight (reuses
+   the two-part-cursor infra → its Wide/Narrow/**Extended** states). **Erase**
+   removes the selection; cut/copy/move via kill-ring + system clipboard. Calc then
+   also evaluates a selection. *Foundational.*
+3. **Undo/redo (nothing lost)** — walk the persisted edit log via a parent chain;
+   `C-/` undo, `C-?` / `C-x u` redo; run coalescing; survives restart.
+4. **Soft word-wrap at the margin** — introduce visual-line layout (logical line →
+   wrapped visual lines) in the core view model; update `tick`/`row_at`/`rows_at`,
+   scroll, and cursor mapping for both front-ends. Cross-cutting; the most invasive.
+5. **The Ruler** — bottom ruler: character scale, a blinking column indicator synced
+   to the cursor, tab stops, margins (the margin ties into word-wrap width).
+
+Later / optional: **Sort** (selected lines), **Explain** (context help overlay),
+**creep** (a LEAP tap with no query nudges one char), spell-check, tree-sitter
+highlighting.
 
 ## Verification
 

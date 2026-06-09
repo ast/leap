@@ -40,6 +40,17 @@ EDITING
   C-k             kill to end of line     C-w  kill the word before the cursor
   C-y             yank (paste) what you killed
 
+SELECTING (the Cat's LEAP-span)
+  C-Space         drop a mark, then move or LEAP — the span lights up
+  C-w  cut    M-w  copy    C-y  paste    Backspace / C-d  erase the selection
+  Calc works on a selection too: select  3 * 14  then press  M-c
+
+CALC — the Cat's built-in calculator
+  Type an arithmetic expression on a line, e.g.   12 * (3 + 4)
+  then press  M-c  (or M-=) and the answer is written in place:
+      12 * (3 + 4) = 84
+  Works with + - * / %, parentheses, and decimals. Run it again to recompute.
+
 DOCUMENTS
   Your stream is divided into documents by a boundary marker, drawn as the
   rule below. Jump between documents with:

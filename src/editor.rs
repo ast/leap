@@ -13,6 +13,7 @@
 use anyhow::Result;
 
 use crate::buffer::Buffer;
+use crate::calc;
 use crate::echo::Echo;
 use crate::input::{KeyChord, LogicalKey};
 use crate::leap::{Dir, Leap};
@@ -158,7 +159,15 @@ impl Editor {
                 self.prefix = Some(Prefix::CtrlX);
                 self.echo.show("C-x-");
             }
-            LogicalKey::Char('g') if ctrl => self.echo.show("Quit"),
+            LogicalKey::Char('g') if ctrl => {
+                self.buffer.clear_mark();
+                self.echo.show("Quit");
+            }
+            // C-Space sets the mark; motion/LEAP then extend the selection.
+            LogicalKey::Char(' ') if ctrl => {
+                self.buffer.set_mark();
+                self.echo.show("Mark set");
+            }
 
             // ---- LEAP (incremental search-to-move) -------------------------
             LogicalKey::Char('s') if ctrl => self.leap_start(Dir::Forward),
@@ -177,12 +186,16 @@ impl Editor {
             LogicalKey::Char('v') if alt => self.page_up(),
             // C-l: redraw and center the cursor's line (Emacs recenter).
             LogicalKey::Char('l') if ctrl => self.recenter(),
+            // M-c (or M-=): evaluate the arithmetic on the current line in place.
+            LogicalKey::Char('c') if alt => self.calc(),
+            LogicalKey::Char('=') if alt => self.calc(),
 
             // ---- Emacs editing ---------------------------------------------
-            LogicalKey::Char('d') if ctrl => self.edit(Buffer::delete_forward),
-            LogicalKey::Char('h') if ctrl => self.edit(Buffer::backspace),
+            LogicalKey::Char('d') if ctrl => self.erase(Buffer::delete_forward),
+            LogicalKey::Char('h') if ctrl => self.erase(Buffer::backspace),
             LogicalKey::Char('k') if ctrl => self.kill(Buffer::kill_line, false),
-            LogicalKey::Char('w') if ctrl => self.kill(Buffer::backward_kill_word, true),
+            LogicalKey::Char('w') if ctrl => self.cut_or_kill_word(),
+            LogicalKey::Char('w') if alt => self.copy(),
             LogicalKey::Char('y') if ctrl => {
                 self.wide = true;
                 self.yank();
@@ -216,8 +229,8 @@ impl Editor {
                 self.wide = true;
                 self.edit(|b| b.insert_char('\t'));
             }
-            LogicalKey::Backspace => self.edit(Buffer::backspace),
-            LogicalKey::Delete => self.edit(Buffer::delete_forward),
+            LogicalKey::Backspace => self.erase(Buffer::backspace),
+            LogicalKey::Delete => self.erase(Buffer::delete_forward),
             // Plain text input (Shift for uppercase is fine; Ctrl/Alt reserved).
             LogicalKey::Char(c) if !ctrl && !alt => {
                 self.wide = true;
@@ -296,6 +309,83 @@ impl Editor {
     /// Run a mutating edit on the buffer.
     fn edit<F: FnOnce(&mut Buffer)>(&mut self, f: F) {
         f(&mut self.buffer);
+    }
+
+    /// Backspace / Delete: erase the selection if there is one, else the single
+    /// character via `op`.
+    fn erase(&mut self, op: fn(&mut Buffer)) {
+        if self.buffer.selection().is_some() {
+            self.buffer.delete_selection();
+        } else {
+            op(&mut self.buffer);
+        }
+    }
+
+    /// `M-w`: copy the selection to the kill ring (and clear the mark).
+    fn copy(&mut self) {
+        if let Some(text) = self.buffer.selection_text() {
+            self.kill_ring = text;
+            self.last_was_kill = false;
+            self.buffer.clear_mark();
+            self.echo.show("Copied");
+        } else {
+            self.echo.show("No selection");
+        }
+    }
+
+    /// `C-w`: cut the selection if any (to the kill ring), else kill the word
+    /// before the cursor.
+    fn cut_or_kill_word(&mut self) {
+        if self.buffer.selection().is_some() {
+            if let Some(text) = self.buffer.delete_selection() {
+                self.kill_ring = text;
+                self.last_was_kill = false;
+            }
+        } else {
+            self.kill(Buffer::backward_kill_word, true);
+        }
+    }
+
+    /// `M-c` / `M-=`: evaluate the arithmetic on the current line and write the
+    /// result in place — `2 + 2` becomes `2 + 2 = 4`. Re-running recomputes (the
+    /// expression is taken from before the last `=`), so it's idempotent. The
+    /// Canon Cat's inline calculator. (Selection-aware Calc lands with selection.)
+    fn calc(&mut self) {
+        // If there's a selection, evaluate it and replace it with the result
+        // (the Cat's "select an expression, compute it" behaviour).
+        if let Some(sel) = self.buffer.selection_text() {
+            let expr = sel.trim();
+            if !expr.is_empty() {
+                match calc::eval(expr) {
+                    Ok(value) => {
+                        self.buffer.delete_selection();
+                        self.buffer.insert_str(&fmt_num(value));
+                        self.wide = true;
+                    }
+                    Err(e) => self.echo.show(format!("Calc: {e}")),
+                }
+                return;
+            }
+        }
+        let line = self.buffer.current_line();
+        // The expression is everything before the last `=` (or the whole line).
+        let expr = match line.rsplit_once('=') {
+            Some((lhs, _)) => lhs,
+            None => &line,
+        }
+        .trim();
+        if expr.is_empty() {
+            self.echo.show("Calc: nothing to evaluate");
+            return;
+        }
+        match calc::eval(expr) {
+            Ok(value) => {
+                self.buffer
+                    .replace_current_line(&format!("{expr} = {}", fmt_num(value)));
+                self.wide = true; // it inserted text
+            }
+            Err(e) => self.echo.show(format!("Calc: {e}")),
+        }
     }
 
     /// Complete a pending prefix key (currently only `C-x`).
@@ -498,12 +588,15 @@ impl Editor {
         let rows = (0..m.text_rows)
             .map(|r| self.row_at(m.top + r, m.left, cols))
             .collect();
+        let highlights = (0..m.text_rows)
+            .map(|r| self.row_highlight(m.top + r, m.left, cols))
+            .collect();
         Ok(Frame {
             rows,
             status: m.status,
             echo: m.echo,
             cursor: m.cursor,
-            leap_hl: m.leap_hl,
+            highlights,
             full_repaint: m.full_repaint,
             redraw_text: m.redraw_text,
         })
@@ -526,17 +619,6 @@ impl Editor {
             self.saved_state = st;
         }
 
-        // LEAP highlight, translated to viewport-relative cells.
-        let leap_hl = self.leap_highlight().and_then(|(line, lo, hi)| {
-            (line >= self.top && line < self.top + text_rows).then(|| {
-                (
-                    line - self.top,
-                    lo.saturating_sub(self.left),
-                    hi.saturating_sub(self.left),
-                )
-            })
-        });
-
         let status = self.status_string(cols);
         let echo: String = match &self.leap {
             Some(l) => l.label().chars().take(cols).collect(),
@@ -556,7 +638,6 @@ impl Editor {
             status,
             echo,
             cursor,
-            leap_hl,
             full_repaint: std::mem::take(&mut self.force_repaint),
             redraw_text: self.leap.is_some(),
         })
@@ -590,6 +671,41 @@ impl Editor {
         (0..count).map(|i| self.row_at(top + i, left, width)).collect()
     }
 
+    /// The inverse-highlight span on absolute line `idx`, in display columns
+    /// relative to `left` and clipped to `width`: the **selection** if one is
+    /// active (so it spans multiple rows), else a **LEAP match** on that line.
+    /// Both front-ends call this per visible row.
+    pub fn row_highlight(&self, idx: usize, left: usize, width: usize) -> Option<(usize, usize)> {
+        if idx >= self.buffer.len_lines() {
+            return None; // a blank row past the end of the buffer
+        }
+        if let Some((s, e)) = self.buffer.selection() {
+            let (ls, le) = self.buffer.line_char_bounds(idx);
+            let from = s.max(ls);
+            let to = e.min(le);
+            if from >= to {
+                return None;
+            }
+            let a = self.buffer.line_col_at(from).1.saturating_sub(left);
+            let b = self.buffer.line_col_at(to).1.saturating_sub(left).min(width);
+            return (b > a).then_some((a, b));
+        }
+        let (line, lo, hi) = self.leap_highlight()?;
+        if line != idx {
+            return None;
+        }
+        let a = lo.saturating_sub(left);
+        let b = hi.saturating_sub(left).min(width);
+        (b > a).then_some((a, b))
+    }
+
+    /// Whether a selection is active (GUI suppresses the wide single-cell cursor
+    /// highlight while a span is selected).
+    #[cfg(feature = "gui")]
+    pub fn selection_active(&self) -> bool {
+        self.buffer.selection().is_some()
+    }
+
     /// The current LEAP match as `(line, start_dcol, end_dcol)` in absolute
     /// display columns, or `None` when not leaping / no match / multi-line.
     fn leap_highlight(&self) -> Option<(usize, usize, usize)> {
@@ -621,6 +737,17 @@ impl Editor {
             total_lines: self.buffer.len_lines(),
         }
         .render(width)
+    }
+}
+
+/// Format a Calc result: drop the fractional part for whole numbers, else trim
+/// trailing zeros (so `4.0`→`4`, `2.50`→`2.5`, `0.1+0.2`→`0.3`).
+fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        (v as i64).to_string()
+    } else {
+        let s = format!("{v:.10}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -673,6 +800,79 @@ mod tests {
         }
         e.input(KeyChord::plain(LogicalKey::Enter)); // land
         assert_eq!(e.buffer.cursor(), 6); // "beta" starts at char 6
+    }
+
+    #[test]
+    fn calc_evaluates_current_line_idempotently() {
+        let mut e = editor_with("2 + 3 * 4");
+        e.input(KeyChord::alt('c'));
+        assert_eq!(e.buffer.current_line(), "2 + 3 * 4 = 14");
+        // Re-running recomputes from the expression before `=` — no drift.
+        e.input(KeyChord::alt('c'));
+        assert_eq!(e.buffer.current_line(), "2 + 3 * 4 = 14");
+    }
+
+    fn right(e: &mut Editor, n: usize) {
+        for _ in 0..n {
+            e.input(KeyChord::plain(LogicalKey::Right));
+        }
+    }
+
+    #[test]
+    fn mark_then_motion_cut_selection() {
+        let mut e = editor_with("hello world");
+        e.input(KeyChord::ctrl(' ')); // set mark at 0
+        right(&mut e, 5); // select "hello"
+        assert_eq!(e.buffer.selection(), Some((0, 5)));
+        e.input(ctrl('w')); // cut
+        assert_eq!(e.buffer.current_line(), " world");
+        assert_eq!(e.kill_ring(), "hello");
+        assert_eq!(e.buffer.selection(), None);
+    }
+
+    #[test]
+    fn copy_keeps_buffer_and_clears_mark() {
+        let mut e = editor_with("abcdef");
+        e.input(KeyChord::ctrl(' '));
+        right(&mut e, 3);
+        e.input(KeyChord::alt('w')); // M-w copy "abc"
+        assert_eq!(e.kill_ring(), "abc");
+        assert_eq!(e.buffer.current_line(), "abcdef"); // unchanged
+        assert_eq!(e.buffer.selection(), None); // mark cleared
+    }
+
+    #[test]
+    fn erase_deletes_selection() {
+        let mut e = editor_with("abcdef");
+        e.input(KeyChord::ctrl(' '));
+        right(&mut e, 3);
+        e.input(KeyChord::plain(LogicalKey::Backspace)); // erase "abc"
+        assert_eq!(e.buffer.current_line(), "def");
+    }
+
+    #[test]
+    fn selection_with_viewport_past_end_does_not_panic() {
+        // Regression: with a selection active, the renderer queries row_highlight
+        // for blank rows past the buffer end — must not index the rope OOB.
+        let mut e = editor_with("a\nb");
+        e.input(KeyChord::ctrl(' ')); // mark
+        e.input(KeyChord::plain(LogicalKey::Down)); // selection [0,2)
+        assert!(e.buffer.selection().is_some());
+        // 10-row viewport over a 2-line buffer → rows past the end are queried.
+        let f = e.compute_frame(20, 10).unwrap();
+        assert_eq!(f.highlights.len(), 8);
+        // Directly hit a past-end row too.
+        assert_eq!(e.row_highlight(50, 0, 20), None);
+    }
+
+    #[test]
+    fn calc_evaluates_selected_expression() {
+        let mut e = editor_with("x = 2+3 done");
+        right(&mut e, 4); // before '2'
+        e.input(KeyChord::ctrl(' '));
+        right(&mut e, 3); // select "2+3"
+        e.input(KeyChord::alt('c'));
+        assert_eq!(e.buffer.current_line(), "x = 5 done");
     }
 
     #[test]
