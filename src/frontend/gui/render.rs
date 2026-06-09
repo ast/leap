@@ -167,18 +167,51 @@ fn ruler_verts(width: u32, height: u32, cell: CellMetrics, scale: f32) -> Vec<Qu
     let cols = (w / adv).floor() as usize;
     let mut verts = Vec::with_capacity((cols + 1) * 6);
     for c in 0..=cols {
-        let level = if c.is_multiple_of(10) {
-            0.70
-        } else if c.is_multiple_of(5) {
-            0.45
-        } else {
-            0.22
-        };
-        let th = lh * level;
+        // Tens columns carry a number instead of a tick (see ruler_labels).
+        if c > 0 && c.is_multiple_of(10) {
+            continue;
+        }
+        let th = lh * if c.is_multiple_of(5) { 0.45 } else { 0.22 };
         let x = c as f32 * adv + adv / 2.0 - tw / 2.0;
         push_rect(&mut verts, [x, ruler_y + lh - th, x + tw, ruler_y + lh], screen, ink);
     }
     verts
+}
+
+/// The ruler number row: the tens digit at every 10th column (`10`→`1`,
+/// `80`→`8`), spaces elsewhere — laid out monospace so digits land on column.
+fn ruler_labels(width: u32, advance: f32) -> String {
+    let cols = (width as f32 / advance).floor() as usize;
+    (0..=cols)
+        .map(|c| {
+            if c > 0 && c.is_multiple_of(10) {
+                std::char::from_digit((c / 10 % 10) as u32, 10).unwrap_or(' ')
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+/// Build a one-line monospace glyph buffer (status/echo/ruler-labels/overlays).
+fn build_line(
+    fs: &mut FontSystem,
+    metrics: Metrics,
+    advance: f32,
+    width: f32,
+    family: Family,
+    text: &str,
+    color: Color,
+) -> Buffer {
+    let mut b = Buffer::new(fs, metrics);
+    b.set_wrap(fs, Wrap::None);
+    b.set_hinting(fs, Hinting::Enabled);
+    b.set_monospace_width(fs, Some(advance));
+    b.set_size(fs, Some(width), Some(metrics.line_height));
+    let attrs = Attrs::new().family(family).color(color);
+    b.set_text(fs, text, &attrs, Shaping::Basic, None);
+    b.shape_until_scroll(fs, false);
+    b
 }
 
 // --- GPU state ------------------------------------------------------------
@@ -200,6 +233,8 @@ pub struct Gpu {
     /// Cached graphical-ruler tick geometry (rebuilt only on resize/scale).
     ruler_quad_buffer: wgpu::Buffer,
     ruler_quad_verts: u32,
+    /// Cached ruler number glyphs (tens digits), shaped once per resize/scale.
+    ruler_label_buf: Buffer,
     metrics: Metrics,
     cell: CellMetrics,
     scale: f32,
@@ -308,6 +343,15 @@ impl Gpu {
             contents: bytemuck::cast_slice(&ruler_init),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let ruler_label_buf = build_line(
+            &mut font_system,
+            metrics,
+            cell.advance,
+            config.width as f32,
+            family_of(&font_family),
+            &ruler_labels(config.width, cell.advance),
+            color(INK),
+        );
 
         Ok(Self {
             surface,
@@ -324,6 +368,7 @@ impl Gpu {
             quad_buffer,
             ruler_quad_buffer,
             ruler_quad_verts,
+            ruler_label_buf,
             metrics,
             cell,
             scale,
@@ -350,7 +395,8 @@ impl Gpu {
         self.rebuild_ruler();
     }
 
-    /// Regenerate the cached ruler tick geometry (after a resize or scale change).
+    /// Regenerate the cached ruler tick geometry + number glyphs (after a resize
+    /// or scale change).
     fn rebuild_ruler(&mut self) {
         let verts = ruler_verts(self.config.width, self.config.height, self.cell, self.scale);
         self.ruler_quad_verts = verts.len() as u32;
@@ -359,6 +405,8 @@ impl Gpu {
             contents: bytemuck::cast_slice(&verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let labels = ruler_labels(self.config.width, self.cell.advance);
+        self.ruler_label_buf = self.make_line(&labels, color(INK));
     }
 
     /// Reconfigure the surface after a window resize (clamped to the GPU's max
@@ -379,19 +427,15 @@ impl Gpu {
 
     /// Build a one-line text buffer (status, echo, and inverse overlays).
     fn make_line(&mut self, text: &str, color: Color) -> Buffer {
-        let mut b = Buffer::new(&mut self.font_system, self.metrics);
-        b.set_wrap(&mut self.font_system, Wrap::None);
-        b.set_hinting(&mut self.font_system, Hinting::Enabled);
-        b.set_monospace_width(&mut self.font_system, Some(self.cell.advance));
-        b.set_size(
+        build_line(
             &mut self.font_system,
-            Some(self.config.width as f32),
-            Some(self.metrics.line_height),
-        );
-        let attrs = Attrs::new().family(family_of(&self.font_family)).color(color);
-        b.set_text(&mut self.font_system, text, &attrs, Shaping::Basic, None);
-        b.shape_until_scroll(&mut self.font_system, false);
-        b
+            self.metrics,
+            self.cell.advance,
+            self.config.width as f32,
+            family_of(&self.font_family),
+            text,
+            color,
+        )
     }
 
     /// Pixel height of one text line (for the front-end's scroll math).
@@ -530,6 +574,7 @@ impl Gpu {
         let body_bounds = TextBounds { left: 0, top: 0, right: self.config.width as i32, bottom: (text_rows as f32 * lh) as i32 };
         let mut areas = vec![
             TextArea { buffer: &self.text_buffer, left: 0.0, top: scene.body_top_px, scale: 1.0, bounds: body_bounds, default_color: color(INK), custom_glyphs: &[] },
+            TextArea { buffer: &self.ruler_label_buf, left: 0.0, top: ruler_y, scale: 1.0, bounds, default_color: color(INK), custom_glyphs: &[] },
             TextArea { buffer: &status_buf, left: 0.0, top: status_y, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] },
             TextArea { buffer: &echo_buf, left: 0.0, top: echo_y, scale: 1.0, bounds, default_color: color(INK), custom_glyphs: &[] },
         ];

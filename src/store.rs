@@ -10,6 +10,7 @@
 //! knows about [`EditOp`]s, snapshots, and resume state, but nothing about the
 //! rope, the cursor semantics, or the terminal.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -197,7 +198,7 @@ impl Store {
             .optional()?
             .unwrap_or((0, String::new()));
 
-        for op in self.edits_between(upto, self.head)? {
+        for op in self.chain(upto, self.head)? {
             op.apply(&mut text);
         }
 
@@ -215,30 +216,115 @@ impl Store {
         })
     }
 
-    /// The edits with `upto < seq <= head`, in application order.
-    ///
-    /// For the linear history this branch produces today (`parent` is always the
-    /// previous `seq`), a `seq` range *is* the chain. When log-scrub undo forks
-    /// the history, this becomes a parent-chain walk instead.
-    fn edits_between(&self, upto: i64, head: i64) -> Result<Vec<EditOp>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT op, pos, body FROM edits
-             WHERE seq > ?1 AND seq <= ?2 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(params![upto, head], |r| {
-            let op: i64 = r.get(0)?;
-            let pos: i64 = r.get(1)?;
-            let body: String = r.get(2)?;
-            Ok((op, pos as usize, body))
+    /// All edit rows keyed by `seq`. The workspace is bounded and the log is
+    /// compacted, so this stays small; undo/redo and replay walk it in memory.
+    fn load_edits(&self) -> Result<HashMap<i64, Edit>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, parent, op, pos, body, group_id FROM edits")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Edit {
+                seq: r.get(0)?,
+                parent: r.get(1)?,
+                group: r.get(5)?,
+                op: decode_op(r.get(2)?, r.get::<_, i64>(3)? as usize, r.get(4)?),
+            })
         })?;
-        let mut ops = Vec::new();
+        let mut map = HashMap::new();
         for row in rows {
-            let (op, pos, text) = row?;
-            ops.push(match op {
-                0 => EditOp::Insert { pos, text },
-                _ => EditOp::Delete { pos, text },
-            });
+            let e = row?;
+            map.insert(e.seq, e);
         }
+        Ok(map)
+    }
+
+    /// The edits on the live history chain from `upto` (exclusive) to `head`, in
+    /// application order — following `parent` pointers, so orphaned (undone-then-
+    /// superseded) branches are skipped.
+    fn chain(&self, upto: i64, head: i64) -> Result<Vec<EditOp>> {
+        let map = self.load_edits()?;
+        let mut chain = Vec::new();
+        let mut cur = head;
+        while cur > upto && cur != 0 {
+            let Some(e) = map.get(&cur) else { break };
+            chain.push(e.op.clone());
+            cur = e.parent;
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    fn set_head(&mut self, head: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE state SET head = ?1 WHERE id = 1", params![head])?;
+        self.head = head;
+        Ok(())
+    }
+
+    /// Undo the most recent edit group: move the head back past the group and
+    /// return the **inverse** ops (newest first) for the caller to apply to the
+    /// buffer. Empty when there's nothing to undo. Rows are never deleted, so a
+    /// later redo (or a new edit, which forks) can still reach them.
+    pub fn undo(&mut self) -> Result<Vec<EditOp>> {
+        if self.head == 0 {
+            return Ok(Vec::new());
+        }
+        let map = self.load_edits()?;
+        let Some(top) = map.get(&self.head) else {
+            return Ok(Vec::new());
+        };
+        let group = top.group;
+        let mut inverses = Vec::new();
+        let mut cur = self.head;
+        let mut new_head = 0;
+        while let Some(e) = map.get(&cur) {
+            if e.group != group {
+                break;
+            }
+            inverses.push(invert(&e.op));
+            new_head = e.parent;
+            cur = e.parent;
+            if cur == 0 {
+                break;
+            }
+        }
+        self.set_head(new_head)?;
+        Ok(inverses)
+    }
+
+    /// Redo the next group — the most-recently-created child branch of the head.
+    /// Returns the forward ops (application order) and advances the head. Empty
+    /// when there's nothing to redo.
+    pub fn redo(&mut self) -> Result<Vec<EditOp>> {
+        let map = self.load_edits()?;
+        let Some(start) = map
+            .values()
+            .filter(|e| e.parent == self.head)
+            .map(|e| e.seq)
+            .max()
+        else {
+            return Ok(Vec::new());
+        };
+        let group = map[&start].group;
+        let mut ops = Vec::new();
+        let mut cur = start;
+        loop {
+            let e = &map[&cur];
+            if e.group != group {
+                break;
+            }
+            ops.push(e.op.clone());
+            match map
+                .values()
+                .filter(|c| c.parent == cur && c.group == group)
+                .map(|c| c.seq)
+                .max()
+            {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        self.set_head(cur)?;
         Ok(ops)
     }
 
@@ -261,6 +347,30 @@ impl Store {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM edits", [], |r| r.get(0))?)
+    }
+}
+
+/// An edit-log row loaded for chain walking / undo / redo.
+struct Edit {
+    seq: i64,
+    parent: i64,
+    group: i64,
+    op: EditOp,
+}
+
+/// Decode an `(op_code, pos, body)` row into an [`EditOp`].
+fn decode_op(op: i64, pos: usize, text: String) -> EditOp {
+    match op {
+        0 => EditOp::Insert { pos, text },
+        _ => EditOp::Delete { pos, text },
+    }
+}
+
+/// The inverse of an edit (what reverses it when applied to the buffer).
+fn invert(op: &EditOp) -> EditOp {
+    match op {
+        EditOp::Insert { pos, text } => EditOp::Delete { pos: *pos, text: text.clone() },
+        EditOp::Delete { pos, text } => EditOp::Insert { pos: *pos, text: text.clone() },
     }
 }
 
@@ -341,6 +451,33 @@ mod tests {
         // Further edits stack on top of the snapshot.
         s.append(&[ins(8, "three")], 3).unwrap();
         assert_eq!(s.resume().unwrap().text, "one two three");
+    }
+
+    #[test]
+    fn undo_redo_move_the_head_for_resume() {
+        // resume() reconstructs from the head, so undo/redo survive a restart.
+        let mut s = Store::open_in_memory().unwrap();
+        s.append(&[ins(0, "ab")], 1).unwrap();
+        s.append(&[ins(2, "cd")], 1).unwrap(); // same group → one undo step
+        assert_eq!(s.resume().unwrap().text, "abcd");
+
+        assert!(!s.undo().unwrap().is_empty());
+        assert_eq!(s.resume().unwrap().text, ""); // head walked back past the group
+
+        assert!(!s.redo().unwrap().is_empty());
+        assert_eq!(s.resume().unwrap().text, "abcd");
+
+        assert!(s.redo().unwrap().is_empty()); // nothing left to redo
+    }
+
+    #[test]
+    fn new_edit_after_undo_forks_and_orphans_redo() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.append(&[ins(0, "abc")], 1).unwrap();
+        s.undo().unwrap(); // back to empty
+        s.append(&[ins(0, "X")], 2).unwrap(); // forks; the "abc" branch is orphaned
+        assert_eq!(s.resume().unwrap().text, "X");
+        assert!(s.redo().unwrap().is_empty()); // can't redo across the new edit
     }
 
     #[test]

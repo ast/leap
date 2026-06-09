@@ -34,8 +34,12 @@ pub struct Editor {
     buffer: Buffer,
     /// The persistent workspace; edits are appended here every keystroke.
     store: Store,
-    /// Coalescing group id for the next batch of edits (bumped per keystroke).
+    /// Undo-coalescing group id for appended edits. A run of consecutive typed
+    /// characters shares one group (so undo reverses the whole run); any other
+    /// action starts a fresh group.
     group: i64,
+    /// Whether the current group is an open run of typed characters.
+    coalescing: bool,
     /// Last `(cursor, top, left)` persisted, to avoid redundant state writes.
     saved_state: (usize, usize, usize),
     /// First visible line (vertical scroll offset).
@@ -78,6 +82,7 @@ impl Editor {
             buffer,
             store,
             group: 0,
+            coalescing: false,
             saved_state: (resume.cursor, resume.top, resume.left),
             top: resume.top,
             left: resume.left,
@@ -104,7 +109,6 @@ impl Editor {
         let ops = self.buffer.take_journal();
         if !ops.is_empty() {
             self.store.append(&ops, self.group)?;
-            self.group += 1;
             self.buffer.mark_saved();
         }
         Ok(())
@@ -146,6 +150,20 @@ impl Editor {
         self.echo.clear();
 
         let (ctrl, alt) = (chord.ctrl, chord.alt);
+
+        // Undo grouping: a run of plain typed characters shares one group (undo
+        // reverses the whole run); any other action starts a fresh group.
+        let is_text_insert = !ctrl && !alt && matches!(chord.key, LogicalKey::Char(_));
+        if is_text_insert {
+            if !self.coalescing {
+                self.group += 1;
+            }
+            self.coalescing = true;
+        } else {
+            self.group += 1;
+            self.coalescing = false;
+        }
+
         // Consecutive kills accumulate; any other command breaks the run.
         let is_kill = ctrl && matches!(chord.key, LogicalKey::Char('k') | LogicalKey::Char('w'));
         if !is_kill {
@@ -186,9 +204,6 @@ impl Editor {
             LogicalKey::Char('v') if alt => self.page_up(),
             // C-l: redraw and center the cursor's line (Emacs recenter).
             LogicalKey::Char('l') if ctrl => self.recenter(),
-            // M-c (or M-=): evaluate the arithmetic on the current line in place.
-            LogicalKey::Char('c') if alt => self.calc(),
-            LogicalKey::Char('=') if alt => self.calc(),
 
             // ---- Emacs editing ---------------------------------------------
             LogicalKey::Char('d') if ctrl => self.erase(Buffer::delete_forward),
@@ -215,6 +230,10 @@ impl Editor {
             LogicalKey::PageUp => self.page_up(),
             LogicalKey::PageDown => self.page_down(),
 
+            // Ctrl+Enter evaluates the line/selection (Calc) instead of inserting
+            // a newline. The GUI always distinguishes it; a terminal needs the
+            // Kitty keyboard protocol (else Ctrl+Enter is just a newline).
+            LogicalKey::Enter if ctrl => self.calc(),
             // M-Enter starts a new document (must precede the plain Enter arm).
             LogicalKey::Enter if alt => {
                 self.wide = true;
@@ -346,10 +365,46 @@ impl Editor {
         }
     }
 
-    /// `M-c` / `M-=`: evaluate the arithmetic on the current line and write the
-    /// result in place — `2 + 2` becomes `2 + 2 = 4`. Re-running recomputes (the
-    /// expression is taken from before the last `=`), so it's idempotent. The
-    /// Canon Cat's inline calculator. (Selection-aware Calc lands with selection.)
+    /// `C-x u`: undo the most recent edit group by applying the store's inverse
+    /// ops to the buffer (the log already records them — no new edits). Survives
+    /// restart, since the store's head moves persistently.
+    fn undo(&mut self) {
+        match self.store.undo() {
+            Ok(ops) if !ops.is_empty() => {
+                for op in &ops {
+                    self.buffer.apply_op_raw(op);
+                }
+                self.buffer.mark_saved();
+                self.coalescing = false;
+                self.force_repaint = true;
+                self.echo.show("Undo");
+            }
+            Ok(_) => self.echo.show("Nothing to undo"),
+            Err(e) => self.echo.show(format!("Undo: {e}")),
+        }
+    }
+
+    /// `C-x C-u`: redo the next group (re-apply the forward ops).
+    fn redo(&mut self) {
+        match self.store.redo() {
+            Ok(ops) if !ops.is_empty() => {
+                for op in &ops {
+                    self.buffer.apply_op_raw(op);
+                }
+                self.buffer.mark_saved();
+                self.coalescing = false;
+                self.force_repaint = true;
+                self.echo.show("Redo");
+            }
+            Ok(_) => self.echo.show("Nothing to redo"),
+            Err(e) => self.echo.show(format!("Redo: {e}")),
+        }
+    }
+
+    /// `Ctrl+Enter`: evaluate the selection if any, else the arithmetic on the
+    /// current line, writing the result in place — `2 + 2` becomes `2 + 2 = 4`.
+    /// Re-running recomputes (the expression is taken from before the last `=`),
+    /// so it's idempotent. The Canon Cat's inline calculator.
     fn calc(&mut self) {
         // If there's a selection, evaluate it and replace it with the result
         // (the Cat's "select an expression, compute it" behaviour).
@@ -397,6 +452,9 @@ impl Editor {
                 // on the Ergodox). Single-chord equivalents are Ctrl+PgUp/PgDn.
                 LogicalKey::Char('p') => self.prev_document(),
                 LogicalKey::Char('n') => self.next_document(),
+                // C-x u undo, C-x C-u redo (the `if ctrl` arm must come first).
+                LogicalKey::Char('u') if ctrl => self.redo(),
+                LogicalKey::Char('u') => self.undo(),
                 // C-x C-c: quit (everything is already saved).
                 LogicalKey::Char('c') if ctrl => self.running = false,
                 LogicalKey::Char('g') if ctrl => self.echo.show("Cancelled"),
@@ -791,6 +849,9 @@ mod tests {
     fn ch(c: char) -> KeyChord {
         KeyChord::plain(LogicalKey::Char(c))
     }
+    fn ctrl_enter() -> KeyChord {
+        KeyChord { key: LogicalKey::Enter, ctrl: true, alt: false, shift: false }
+    }
 
     #[test]
     fn typing_inserts_and_persists() {
@@ -825,10 +886,10 @@ mod tests {
     #[test]
     fn calc_evaluates_current_line_idempotently() {
         let mut e = editor_with("2 + 3 * 4");
-        e.input(KeyChord::alt('c'));
+        e.input(ctrl_enter());
         assert_eq!(e.buffer.current_line(), "2 + 3 * 4 = 14");
         // Re-running recomputes from the expression before `=` — no drift.
-        e.input(KeyChord::alt('c'));
+        e.input(ctrl_enter());
         assert_eq!(e.buffer.current_line(), "2 + 3 * 4 = 14");
     }
 
@@ -887,12 +948,30 @@ mod tests {
     }
 
     #[test]
+    fn undo_redo_coalesces_typing() {
+        let mut e = editor_with("");
+        for c in "hello".chars() {
+            e.input(ch(c));
+            e.persist_edits().unwrap();
+        }
+        assert_eq!(e.buffer.current_line(), "hello");
+        // C-x u → the whole typed run undoes as one group.
+        e.input(ctrl('x'));
+        e.input(KeyChord::plain(LogicalKey::Char('u')));
+        assert_eq!(e.buffer.current_line(), "");
+        // C-x C-u → redo brings it back.
+        e.input(ctrl('x'));
+        e.input(KeyChord::ctrl('u'));
+        assert_eq!(e.buffer.current_line(), "hello");
+    }
+
+    #[test]
     fn calc_evaluates_selected_expression() {
         let mut e = editor_with("x = 2+3 done");
         right(&mut e, 4); // before '2'
         e.input(KeyChord::ctrl(' '));
         right(&mut e, 3); // select "2+3"
-        e.input(KeyChord::alt('c'));
+        e.input(ctrl_enter());
         assert_eq!(e.buffer.current_line(), "x = 5 done");
     }
 

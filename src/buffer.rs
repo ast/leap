@@ -466,6 +466,26 @@ impl Buffer {
         self.on_edit();
     }
 
+    /// Apply an [`EditOp`] directly to the rope **without journaling** — used by
+    /// undo/redo, which replay ops already recorded in the store (so they must
+    /// not produce new log entries). Moves the cursor to the edit site.
+    pub fn apply_op_raw(&mut self, op: &EditOp) {
+        match op {
+            EditOp::Insert { pos, text } => {
+                self.rope.insert(*pos, text);
+                self.cursor = pos + text.chars().count();
+            }
+            EditOp::Delete { pos, text } => {
+                let end = pos + text.chars().count();
+                self.rope.remove(*pos..end);
+                self.cursor = *pos;
+            }
+        }
+        self.goal_col = None;
+        self.anchor = None;
+        self.text_cache.get_mut().take();
+    }
+
     /// Insert a string at the cursor (used by yank); advances past it.
     pub fn insert_str(&mut self, s: &str) {
         if s.is_empty() {

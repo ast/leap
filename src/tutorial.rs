@@ -43,11 +43,16 @@ EDITING
 SELECTING (the Cat's LEAP-span)
   C-Space         drop a mark, then move or LEAP — the span lights up
   C-w  cut    M-w  copy    C-y  paste    Backspace / C-d  erase the selection
-  Calc works on a selection too: select  3 * 14  then press  M-c
+  Calc works on a selection too: select  3 * 14  then press  Ctrl+Enter
+
+UNDO
+  C-x u    undo        C-x C-u    redo
+  A run of typing undoes as one step. Nothing is ever lost: undo even works
+  across restarts, since every keystroke is in the workspace's history.
 
 CALC — the Cat's built-in calculator
   Type an arithmetic expression on a line, e.g.   12 * (3 + 4)
-  then press  M-c  (or M-=) and the answer is written in place:
+  then press  Ctrl+Enter  and the answer is written in place:
       12 * (3 + 4) = 84
   Works with + - * / %, parentheses, and decimals. Run it again to recompute.
 
