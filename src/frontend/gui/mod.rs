@@ -24,7 +24,57 @@ use winit::window::{Window, WindowId};
 use crate::editor::Editor;
 use crate::input::{KeyChord, LogicalKey};
 use crate::view::Row;
-use render::{Gpu, LeapDraw, Scene};
+use render::{Gpu, LeapDraw, RenderStats, Scene};
+
+/// Frame-time instrumentation, enabled by setting the `LEAP_PERF` env var.
+/// Prints a summary every 120 rendered frames and on exit.
+#[derive(Default)]
+struct Perf {
+    on: bool,
+    frames: u32,
+    cpu_sum: u128,
+    cpu_max: u128,
+    reshapes: u32,
+}
+
+impl Perf {
+    fn new() -> Self {
+        Self {
+            on: std::env::var_os("LEAP_PERF").is_some(),
+            ..Default::default()
+        }
+    }
+
+    fn record(&mut self, s: RenderStats) {
+        if !self.on {
+            return;
+        }
+        self.frames += 1;
+        self.cpu_sum += s.cpu_us;
+        self.cpu_max = self.cpu_max.max(s.cpu_us);
+        self.reshapes += u32::from(s.reshaped);
+        if self.frames >= 120 {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.on || self.frames == 0 {
+            return;
+        }
+        eprintln!(
+            "leap-perf: {} frames · cpu avg {:.2}ms max {:.2}ms · {} reshapes",
+            self.frames,
+            self.cpu_sum as f64 / self.frames as f64 / 1000.0,
+            self.cpu_max as f64 / 1000.0,
+            self.reshapes,
+        );
+        self.frames = 0;
+        self.cpu_sum = 0;
+        self.cpu_max = 0;
+        self.reshapes = 0;
+    }
+}
 
 /// Exponential time constant for scroll easing (seconds): snappy but smooth.
 const SCROLL_TAU: f32 = 0.06;
@@ -69,6 +119,7 @@ pub fn run(editor: Editor) -> Result<()> {
         last_frame: None,
         blink_epoch: Instant::now(),
         blink_drawn: true,
+        perf: Perf::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -92,6 +143,7 @@ struct App {
     blink_epoch: Instant,
     /// The blink visibility last drawn, so we only repaint on a real toggle.
     blink_drawn: bool,
+    perf: Perf,
 }
 
 impl App {
@@ -104,6 +156,7 @@ impl App {
 
 impl App {
     fn exit(&mut self, event_loop: &ActiveEventLoop) {
+        self.perf.flush();
         let _ = self.editor.shutdown();
         event_loop.exit();
     }
@@ -238,8 +291,9 @@ impl App {
             }),
             preedit: &self.preedit,
         };
-        if let Err(e) = gpu.render(&scene) {
-            eprintln!("leap-gui: render error: {e}");
+        match gpu.render(&scene) {
+            Ok(stats) => self.perf.record(stats),
+            Err(e) => eprintln!("leap-gui: render error: {e}"),
         }
 
         if let Some(w) = &self.window {

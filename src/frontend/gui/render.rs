@@ -7,8 +7,10 @@
 //! text again in paper so it stays legible.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
+use glyphon::cosmic_text::Hinting;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
@@ -17,6 +19,15 @@ use winit::window::Window;
 
 use super::font::{self, CellMetrics};
 use crate::view::Row;
+
+/// Per-frame timing/counters for the `LEAP_PERF` instrumentation.
+#[derive(Clone, Copy)]
+pub struct RenderStats {
+    /// CPU time for layout + glyph prepare + encode (excludes the vsync present wait).
+    pub cpu_us: u128,
+    /// Whether the body was re-shaped this frame (vs. served from cache).
+    pub reshaped: bool,
+}
 
 /// A pixel-positioned description of one frame, laid out by the front-end (which
 /// owns the scroll animation). The renderer just draws it.
@@ -231,6 +242,10 @@ impl Gpu {
         let cell = font::measure_cell(&mut font_system, metrics, fam);
         let mut text_buffer = Buffer::new(&mut font_system, metrics);
         text_buffer.set_wrap(&mut font_system, Wrap::None);
+        // Metrics hinting (off by default) snaps glyphs to integer X; with a
+        // whole-pixel monospace width the grid is pixel-aligned → crisper text.
+        text_buffer.set_hinting(&mut font_system, Hinting::Enabled);
+        text_buffer.set_monospace_width(&mut font_system, Some(cell.advance));
 
         Ok(Self {
             surface,
@@ -268,6 +283,8 @@ impl Gpu {
         };
         self.cell = font::measure_cell(&mut self.font_system, self.metrics, fam);
         self.text_buffer.set_metrics(&mut self.font_system, self.metrics);
+        self.text_buffer
+            .set_monospace_width(&mut self.font_system, Some(self.cell.advance));
     }
 
     /// Reconfigure the surface after a window resize.
@@ -288,6 +305,8 @@ impl Gpu {
     fn make_line(&mut self, text: &str, color: Color) -> Buffer {
         let mut b = Buffer::new(&mut self.font_system, self.metrics);
         b.set_wrap(&mut self.font_system, Wrap::None);
+        b.set_hinting(&mut self.font_system, Hinting::Enabled);
+        b.set_monospace_width(&mut self.font_system, Some(self.cell.advance));
         b.set_size(
             &mut self.font_system,
             Some(self.config.width as f32),
@@ -318,7 +337,9 @@ impl Gpu {
     }
 
     /// Draw a [`Scene`] already laid out in pixels by the front-end.
-    pub fn render(&mut self, scene: &Scene) -> Result<()> {
+    pub fn render(&mut self, scene: &Scene) -> Result<RenderStats> {
+        let t0 = Instant::now();
+        let mut reshaped = false;
         let composing = !scene.preedit.is_empty();
         let text_rows = scene.text_rows;
         let lh = self.metrics.line_height;
@@ -354,6 +375,7 @@ impl Gpu {
             self.text_buffer.shape_until_scroll(&mut self.font_system, false);
             self.last_body = body;
             self.last_dims = dims;
+            reshaped = true;
         }
 
         // Inverse ink rectangles: status bar, LEAP match, cursor block.
@@ -410,9 +432,9 @@ impl Gpu {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(RenderStats { cpu_us: t0.elapsed().as_micros(), reshaped });
             }
-            _ => return Ok(()),
+            _ => return Ok(RenderStats { cpu_us: t0.elapsed().as_micros(), reshaped }),
         };
         let view = surface_tex
             .texture
@@ -485,9 +507,11 @@ impl Gpu {
         }
 
         self.queue.submit(Some(encoder.finish()));
+        // Measure CPU work *before* present so the vsync wait isn't counted.
+        let cpu_us = t0.elapsed().as_micros();
         surface_tex.present();
         self.atlas.trim();
-        Ok(())
+        Ok(RenderStats { cpu_us, reshaped })
     }
 }
 

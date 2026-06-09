@@ -69,7 +69,10 @@ pub fn measure_cell(font_system: &mut FontSystem, m: Metrics, family: Family) ->
         .filter(|w| *w > 0.0)
         .unwrap_or(m.font_size * 0.6);
     CellMetrics {
-        advance,
+        // Round to a whole pixel so the monospace grid is pixel-aligned (used as
+        // the buffer's monospace_width too) — crisper grayscale, no fractional-x
+        // blur on vertical stems.
+        advance: advance.round().max(1.0),
         line_height: m.line_height,
     }
 }
