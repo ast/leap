@@ -251,35 +251,34 @@ impl App {
                 _ => None,
             }
         };
-        let cursor_glyph = glyph_at(cursor_col);
-        // Solid erase highlight on the character to the left — only in the Cat's
-        // "wide" (just-typed) state, and not at the start of a line. After a
-        // move/leap the cursor is "narrow": a single blinking block.
-        // The wide single-cell highlight only shows in the typed "wide" state and
-        // when no span selection is active (the selection supersedes it).
-        let highlight = (self.editor.cursor_wide()
+        // The solid-black trailing cell (the just-typed char) shows only in the
+        // Cat's "wide" state, not at line start, and not while a span selection is
+        // active (the selection supersedes it).
+        let show_trailing = self.editor.cursor_wide()
             && !self.editor.selection_active()
-            && cursor_col > 0)
-            .then(|| (((cursor_col - 1) as f32 * adv, cursor_y), glyph_at(cursor_col - 1)));
+            && cursor_col > 0;
+        let highlight = show_trailing.then(|| ((cursor_col - 1) as f32 * adv, cursor_y));
+        let highlight_glyph = if show_trailing { glyph_at(cursor_col - 1) } else { None };
         let cursor_visible = blink_visible(self.blink_epoch, now);
         self.blink_drawn = cursor_visible;
 
-        // Inverse highlight spans (selection — possibly multi-row — or a LEAP
-        // match), one per highlighted row in the animated window.
-        let mut span_data: Vec<(f32, f32, f32, String)> = Vec::new();
-        for (i, row) in body.iter().enumerate() {
-            if let Some((a, b)) = self.editor.row_highlight(first + i, left, cols) {
-                let text = match row {
-                    Row::Text(t) => t.chars().skip(a).take(b - a).collect::<String>(),
-                    _ => String::new(),
-                };
-                let y = (first + i) as f32 * lh - scroll_px;
-                span_data.push((a as f32 * adv, y, (b - a) as f32 * adv, text));
-            }
-        }
-        let spans: Vec<HighlightSpan> = span_data
+        // Solid-black selection spans (selection — possibly multi-row — or a LEAP
+        // match), one per highlighted row in the animated window. Each carries its
+        // text, re-drawn in paper so the marked region reads white-on-black.
+        let spans: Vec<HighlightSpan> = body
             .iter()
-            .map(|(x, y, w, t)| HighlightSpan { x: *x, y: *y, width: *w, text: t })
+            .enumerate()
+            .filter_map(|(i, row)| {
+                self.editor.row_highlight(first + i, left, cols).map(|(a, b)| HighlightSpan {
+                    x: a as f32 * adv,
+                    y: (first + i) as f32 * lh - scroll_px,
+                    width: (b - a) as f32 * adv,
+                    text: match row {
+                        Row::Text(t) => t.chars().skip(a).take(b - a).collect(),
+                        _ => String::new(),
+                    },
+                })
+            })
             .collect();
 
         let scene = Scene {
@@ -289,10 +288,9 @@ impl App {
             status: &meta.status,
             echo: &meta.echo,
             cursor_px,
-            cursor_glyph: cursor_glyph.as_deref(),
             cursor_visible,
-            highlight_px: highlight.as_ref().map(|(px, _)| *px),
-            highlight_glyph: highlight.as_ref().and_then(|(_, g)| g.as_deref()),
+            highlight_px: highlight,
+            highlight_glyph: highlight_glyph.as_deref(),
             spans: &spans,
             preedit: &self.preedit,
         };

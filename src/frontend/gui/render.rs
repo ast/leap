@@ -41,39 +41,43 @@ pub struct Scene<'a> {
     pub text_rows: usize,
     pub status: &'a str,
     pub echo: &'a str,
-    /// Canon Cat two-part cursor — the **blinking** insertion cursor (where the
-    /// next char appears): cell top-left in pixels, the glyph under it, and the
-    /// blink state.
+    /// Canon Cat two-part cursor — the **blinking, gray** insertion cursor (the
+    /// leading edge, where the next char appears): cell top-left + blink state.
+    /// Gray, so the body text under it stays readable (no inverse glyph needed).
     pub cursor_px: (f32, f32),
-    pub cursor_glyph: Option<&'a str>,
     pub cursor_visible: bool,
-    /// …and the **solid** erase highlight on the character left of the cursor
-    /// (what Backspace removes). `None` at the start of a line, or while a span
-    /// selection is active.
+    /// …and the **solid-black** trailing cell — the just-typed character (what
+    /// Backspace removes), with its glyph inverted to paper. `None` at the start
+    /// of a line, or while a span selection is active.
     pub highlight_px: Option<(f32, f32)>,
     pub highlight_glyph: Option<&'a str>,
-    /// Inverse highlight spans (the selection — possibly multi-row — or a LEAP
-    /// match), one per highlighted visible row.
-    pub spans: &'a [HighlightSpan<'a>],
+    /// Solid-black selection spans (the marked region — possibly multi-row — or
+    /// a LEAP match), one per highlighted visible row, with the text re-drawn in
+    /// paper (inverse) so it stays legible.
+    pub spans: &'a [HighlightSpan],
     /// In-progress IME composition, shown inline at the cursor.
     pub preedit: &'a str,
 }
 
-/// One inverse-highlight span (selection row or LEAP match), in pixels. `text`
-/// is the highlighted substring, re-drawn in paper over the ink rectangle.
-pub struct HighlightSpan<'a> {
+/// One solid-black selection rectangle, in pixels; `text` is the highlighted
+/// substring, re-drawn in paper over the ink rectangle.
+pub struct HighlightSpan {
     pub x: f32,
     pub y: f32,
     pub width: f32,
-    pub text: &'a str,
+    pub text: String,
 }
 
 // --- Canon Cat palette (compile-time) ------------------------------------
 
 /// Paper-white background (and inverse foreground).
 const PAPER: (u8, u8, u8) = (0xF7, 0xF4, 0xEC);
-/// Dark ink text (and inverse background).
+/// Dark ink text (and inverse background); the solid blinking cursor.
 const INK: (u8, u8, u8) = (0x1C, 0x1A, 0x17);
+/// 50% gray (paper/ink midpoint) — the Canon Cat's selection/highlight, drawn
+/// behind the ink text so the selected characters stay legible (the Cat used a
+/// checkerboard dither for the same effect on its 1-bit screen).
+const GRAY: (u8, u8, u8) = (0x89, 0x87, 0x81);
 
 fn color(rgb: (u8, u8, u8)) -> Color {
     Color::rgb(rgb.0, rgb.1, rgb.2)
@@ -495,8 +499,11 @@ impl Gpu {
         let status_y = (text_rows as f32 + 1.0) * lh;
         let echo_y = (text_rows as f32 + 2.0) * lh;
 
-        // Inverse ink rectangles: status bar, highlight spans, ruler marker, cursor.
+        // Solid ink: status bar, the selection spans, and the just-typed
+        // trailing cell — all draw their text inverted to paper. Gray: the
+        // blinking insertion cursor, behind the ink body text it sits over.
         let ink_lin = linear(INK);
+        let gray_lin = linear(GRAY);
         let mut quads: Vec<QuadVertex> = Vec::with_capacity(QUAD_CAPACITY * 6);
         push_rect(&mut quads, [0.0, status_y, w, status_y + lh], screen, ink_lin);
         for s in scene.spans {
@@ -511,37 +518,32 @@ impl Gpu {
             push_rect(&mut quads, [mx, ruler_y, mx + mw, ruler_y + lh], screen, ink_lin);
         }
         if !composing {
-            // Solid erase highlight (the character to the left).
+            // Solid-black trailing cell — the just-typed char (Backspace target).
             if let Some((hx, hy)) = scene.highlight_px {
                 push_rect(&mut quads, [hx, hy, hx + adv, hy + lh], screen, ink_lin);
             }
-            // Blinking insertion cursor.
+            // Gray blinking insertion cursor (leading); readable text shows through.
             if scene.cursor_visible {
-                push_rect(&mut quads, [cur_x, cur_y, cur_x + adv, cur_y + lh], screen, ink_lin);
+                push_rect(&mut quads, [cur_x, cur_y, cur_x + adv, cur_y + lh], screen, gray_lin);
             }
         }
         self.queue
             .write_buffer(&self.quad_buffer, 0, bytemuck::cast_slice(&quads));
         let quad_verts = quads.len() as u32;
 
-        // Paper overlays for the inverse regions.
+        // Paper overlays. The gray insertion cursor needs none — the ink body
+        // text shows through it. The solid-black status bar, selection spans,
+        // and trailing cell all invert their glyphs to paper.
         let status_buf = self.make_line(scene.status, color(PAPER));
         let echo_buf = self.make_line(scene.echo, color(INK));
         let span_bufs: Vec<(Buffer, f32, f32)> = scene
             .spans
             .iter()
-            .filter(|s| !s.text.is_empty())
-            .map(|s| (self.make_line(s.text, color(PAPER)), s.x, s.y))
+            .map(|s| (self.make_line(&s.text, color(PAPER)), s.x, s.y))
             .collect();
         let highlight_buf = match (scene.highlight_px, scene.highlight_glyph) {
             (Some((hx, hy)), Some(g)) if !composing => {
                 Some((self.make_line(g, color(PAPER)), hx, hy))
-            }
-            _ => None,
-        };
-        let cursor_buf = match scene.cursor_glyph {
-            Some(g) if !composing && scene.cursor_visible => {
-                Some((self.make_line(g, color(PAPER)), cur_x, cur_y))
             }
             _ => None,
         };
@@ -582,9 +584,6 @@ impl Gpu {
             areas.push(TextArea { buffer: buf, left: *left, top: *top, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] });
         }
         if let Some((buf, left, top)) = &highlight_buf {
-            areas.push(TextArea { buffer: buf, left: *left, top: *top, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] });
-        }
-        if let Some((buf, left, top)) = &cursor_buf {
             areas.push(TextArea { buffer: buf, left: *left, top: *top, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] });
         }
         if let Some((buf, left, top)) = &preedit_buf {
