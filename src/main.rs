@@ -1,46 +1,56 @@
-//! leap — a modeless, LEAP-driven terminal text editor.
+//! leap — a modeless, LEAP-driven terminal text editor (Canon Cat edition).
 //!
-//! See `docs/DESIGN.md` for the architecture and milestone plan.
+//! See `docs/CANON_CAT.md` for this branch's fileless, database-backed design,
+//! and `docs/DESIGN.md` for the original architecture.
 
 mod buffer;
 mod echo;
 mod editor;
-mod finder;
-mod hold;
 mod leap;
 mod statusline;
+mod store;
 mod terminal;
-mod walk;
-
-use std::path::PathBuf;
+mod tutorial;
 
 use anyhow::Result;
 use clap::Parser;
 
 use crate::editor::Editor;
+use crate::store::{EditOp, Store};
 
 /// A modeless, LEAP-driven terminal text editor in the spirit of the Canon Cat.
+///
+/// There are no files: the entire workspace is one continuous text stream kept
+/// in a database under your XDG data dir, resumed exactly where you left off.
 #[derive(Parser, Debug)]
 #[command(name = "leap", version, about)]
-struct Cli {
-    /// File to open.
-    file: Option<PathBuf>,
-
-    /// Position the view at this 1-based line number.
-    #[arg(long, value_name = "N", default_value_t = 1)]
-    line: usize,
-
-    /// Open the file read-only.
-    #[arg(long)]
-    readonly: bool,
-}
+struct Cli {}
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let _cli = Cli::parse();
 
-    // Hold the terminal guard for the whole session; dropping it (normal exit,
-    // `?` error, or panic) restores the terminal.
-    let guard = terminal::setup()?;
-    let mut editor = Editor::open(cli.file, cli.line, cli.readonly, guard.kbd_enhanced())?;
+    // Open (or create) the single fixed workspace. `LEAP_WORKSPACE` overrides
+    // the path — undocumented, for tests so they never touch the real database.
+    let path = match std::env::var_os("LEAP_WORKSPACE") {
+        Some(p) => p.into(),
+        None => Store::default_path()?,
+    };
+    let mut store = Store::open(&path)?;
+
+    // First run: seed the empty workspace with the tutorial, as the Cat shipped
+    // its manual *inside* the workspace — ordinary text you can edit or delete.
+    if store.head() == 0 {
+        store.append(
+            &[EditOp::Insert {
+                pos: 0,
+                text: tutorial::TUTORIAL.to_string(),
+            }],
+            0,
+        )?;
+    }
+
+    // The terminal guard restores raw mode / alt screen on any exit (incl. panic).
+    let _guard = terminal::setup()?;
+    let mut editor = Editor::new(store)?;
     editor.run()
 }

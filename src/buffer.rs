@@ -1,82 +1,71 @@
-//! The editable document.
+//! The editable document — the Canon Cat branch's single continuous text stream.
 //!
 //! A [`Buffer`] wraps a [`ropey::Rope`] and owns the editing state that goes
 //! with it: the cursor, a sticky goal column for vertical movement, the dirty
 //! flag, and a monotonic version counter (used later to discard stale results
 //! from background workers — see `docs/DESIGN.md`).
 //!
+//! On this branch there are **no files**. Every mutation is also recorded in a
+//! [journal](Buffer::take_journal) of [`EditOp`]s, which the editor drains and
+//! appends to the SQLite [store](crate::store) after each keystroke — so the
+//! workspace is persisted continuously and resumes exactly where you left off.
+//!
 //! The cursor is a single `char` index into the rope (`0..=len_chars`). Line and
 //! column are derived from it on demand via the rope's index maps. Columns come
 //! in two flavours: **char columns** (used for movement and the status line) and
 //! **display columns** (tabs expanded), used for rendering and scrolling.
 
-use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
 use ropey::Rope;
+
+use crate::store::EditOp;
 
 /// Width a tab expands to on screen. Will become a compile-time theme/option;
 /// hard-coded for now.
 const TAB_WIDTH: usize = 4;
 
-/// Line-ending style. The in-memory rope is always normalised to `\n`; the
-/// original style is remembered and reapplied on save so files keep their EOLs.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Eol {
-    Lf,
-    Crlf,
-}
-
 /// An open document plus its cursor and edit state.
 pub struct Buffer {
     rope: Rope,
-    path: Option<PathBuf>,
-    readonly: bool,
-    eol: Eol,
     /// Cursor as a char index into the rope, in `0..=rope.len_chars()`.
     cursor: usize,
     /// Sticky target display-agnostic char column for up/down; cleared by any
     /// horizontal move or edit.
     goal_col: Option<usize>,
     dirty: bool,
-    version: u64,
+    /// Edits applied since the last drain, in apply order, awaiting persistence.
+    journal: Vec<EditOp>,
 }
 
 impl Buffer {
-    /// Open `path` (reading it if it exists, otherwise an empty buffer that will
-    /// be created on save), or an empty unnamed buffer when `path` is `None`.
-    pub fn open(path: Option<PathBuf>, readonly: bool) -> Result<Self> {
-        let (rope, eol) = match &path {
-            Some(p) if p.exists() => read_file(p)?,
-            _ => (Rope::new(), Eol::Lf),
-        };
-        Ok(Self {
-            rope,
-            path,
-            readonly,
-            eol,
-            cursor: 0,
+    /// Build a buffer from existing text (e.g. a [`crate::store::Resume`]),
+    /// placing the cursor at char index `cursor`. The text is treated as already
+    /// persisted, so it does not enter the journal and the buffer starts clean.
+    pub fn from_text(text: &str, cursor: usize) -> Self {
+        Self {
+            cursor: cursor.min(text.chars().count()),
+            rope: Rope::from_str(text),
             goal_col: None,
             dirty: false,
-            version: 0,
-        })
+            journal: Vec::new(),
+        }
     }
 
     // --- accessors -------------------------------------------------------
 
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
-    pub fn readonly(&self) -> bool {
-        self.readonly
-    }
-
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Clear the dirty flag — called by the editor once the journal has been
+    /// flushed to the store, so "dirty" tracks *unpersisted* edits (essentially
+    /// never set, since we persist every keystroke).
+    pub fn mark_saved(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Drain the pending edits for the store to append. Apply order is preserved.
+    pub fn take_journal(&mut self) -> Vec<EditOp> {
+        std::mem::take(&mut self.journal)
     }
 
     /// Number of lines for display. A trailing newline yields a final empty
@@ -140,78 +129,6 @@ impl Buffer {
         find_last_before(&text, needle, before_byte, insensitive).map(|b| self.rope.byte_to_char(b))
     }
 
-    // --- file I/O --------------------------------------------------------
-
-    /// Save to the buffer's current path. The path must already be set (callers
-    /// prompt for a name via "save as" otherwise).
-    pub fn save(&mut self) -> Result<()> {
-        let path = self.path.clone().context("no file name")?;
-        self.write_to(&path)?;
-        self.dirty = false;
-        Ok(())
-    }
-
-    /// Save to `path`, adopting it as the buffer's path going forward.
-    pub fn save_as(&mut self, path: PathBuf) -> Result<()> {
-        self.write_to(&path)?;
-        self.path = Some(path);
-        self.dirty = false;
-        Ok(())
-    }
-
-    /// Replace the buffer contents with `path` (or an empty buffer if it does
-    /// not yet exist), adopting it as the buffer's path. Returns whether the
-    /// file already existed.
-    pub fn load(&mut self, path: &Path) -> Result<bool> {
-        let (rope, eol, existed) = if path.exists() {
-            let (rope, eol) = read_file(path)?;
-            (rope, eol, true)
-        } else {
-            (Rope::new(), Eol::Lf, false)
-        };
-        self.rope = rope;
-        self.eol = eol;
-        self.path = Some(path.to_path_buf());
-        self.cursor = 0;
-        self.goal_col = None;
-        self.dirty = false;
-        self.version += 1;
-        Ok(existed)
-    }
-
-    /// Atomically write the buffer to `path`: serialise (reapplying the EOL
-    /// style) to a temp file in the same directory, then rename over the target
-    /// so a crash mid-write can't truncate the original.
-    fn write_to(&self, path: &Path) -> Result<()> {
-        let text: String = self.rope.chunks().collect();
-        let data = match self.eol {
-            Eol::Lf => text,
-            Eol::Crlf => text.replace('\n', "\r\n"),
-        };
-
-        let tmp = temp_path(path);
-        let write = || -> Result<()> {
-            let mut file = File::create(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
-            file.write_all(data.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        };
-        if let Err(e) = write() {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-
-        // Keep the original file's permissions across the replace.
-        if let Ok(meta) = fs::metadata(path) {
-            let _ = fs::set_permissions(&tmp, meta.permissions());
-        }
-        fs::rename(&tmp, path).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })?;
-        Ok(())
-    }
-
     /// Cursor position as `(line, char_col)`, both 0-based.
     pub fn cursor_line_col(&self) -> (usize, usize) {
         let line = self.rope.char_to_line(self.cursor);
@@ -238,7 +155,7 @@ impl Buffer {
         let mut expanded = String::new();
         let mut col = 0;
         for c in self.rope.line(line).chars() {
-            if c == '\n' || c == '\r' {
+            if c == '\n' || c == '\r' || c == Self::DOC_MARKER {
                 continue;
             }
             if c == '\t' {
@@ -308,13 +225,6 @@ impl Buffer {
         self.goal_col = None;
     }
 
-    /// Place the cursor at the start of `line` (1-based), clamped.
-    pub fn goto_line(&mut self, line: usize) {
-        let target = line.saturating_sub(1).min(self.rope.len_lines().saturating_sub(1));
-        self.cursor = self.rope.line_to_char(target);
-        self.goal_col = None;
-    }
-
     fn move_vertical(&mut self, dir: isize) {
         let (line, col) = self.cursor_line_col();
         // Remember the column we started a vertical run from, so passing through
@@ -329,14 +239,84 @@ impl Buffer {
         self.cursor = self.rope.line_to_char(target) + new_col;
     }
 
+    // --- document boundaries (Canon Cat) ---------------------------------
+
+    /// The in-band sentinel char marking a document boundary in the stream:
+    /// U+001E RECORD SEPARATOR. One char wide, never typed by a user, rendered
+    /// specially by the editor.
+    pub const DOC_MARKER: char = '\u{1e}';
+
+    /// Char index of the next document marker strictly after the cursor.
+    fn next_marker(&self) -> Option<usize> {
+        (self.cursor + 1..self.rope.len_chars())
+            .find(|&i| self.rope.char(i) == Self::DOC_MARKER)
+    }
+
+    /// The leading text of the document containing the cursor (from just after
+    /// the preceding marker to the end of that line), used as a status label.
+    pub fn document_title(&self, max: usize) -> String {
+        let start = self.current_document_start();
+        self.rope
+            .chars_at(start)
+            .take_while(|&c| c != '\n' && c != Self::DOC_MARKER)
+            .filter(|c| !c.is_control())
+            .take(max)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    fn prev_marker_at_or_before(&self, pos: usize) -> Option<usize> {
+        (0..pos).rev().find(|&i| self.rope.char(i) == Self::DOC_MARKER)
+    }
+
+    /// Whether `line` is a lone document-boundary marker (so the editor can draw
+    /// it as a horizontal rule instead of a stray control char).
+    pub fn line_is_marker(&self, line: usize) -> bool {
+        line < self.rope.len_lines() && self.rope.line(line).chars().next() == Some(Self::DOC_MARKER)
+    }
+
+    /// First char of the document body that the marker at char index `m`
+    /// introduces — i.e. the start of the line after the marker.
+    fn marker_body_start(&self, m: usize) -> usize {
+        let next_line = self.rope.char_to_line(m) + 1;
+        self.rope.line_to_char(next_line.min(self.rope.len_lines()))
+    }
+
+    /// Start of the document body containing char index `pos`.
+    fn document_start_containing(&self, pos: usize) -> usize {
+        match self.prev_marker_at_or_before(pos) {
+            Some(m) => self.marker_body_start(m),
+            None => 0,
+        }
+    }
+
+    /// Start of the document the cursor is in (`C-x [` first lands here).
+    pub fn current_document_start(&self) -> usize {
+        self.document_start_containing(self.cursor)
+    }
+
+    /// Start of the document before the cursor's, if any (`C-x [` again).
+    pub fn prev_document_start(&self) -> Option<usize> {
+        let cur = self.current_document_start();
+        (cur > 0).then(|| self.document_start_containing(cur.saturating_sub(2)))
+    }
+
+    /// Start of the next document after the cursor's, if any (`C-x ]`).
+    pub fn next_document_start(&self) -> Option<usize> {
+        self.next_marker().map(|m| self.marker_body_start(m))
+    }
+
     // --- editing ---------------------------------------------------------
 
     pub fn insert_char(&mut self, c: char) {
-        if self.readonly {
-            return;
-        }
-        self.rope.insert_char(self.cursor, c);
+        let pos = self.cursor;
+        self.rope.insert_char(pos, c);
         self.cursor += 1;
+        self.journal.push(EditOp::Insert {
+            pos,
+            text: c.to_string(),
+        });
         self.on_edit();
     }
 
@@ -344,32 +324,57 @@ impl Buffer {
         self.insert_char('\n');
     }
 
+    /// Start a new document at the cursor (`C-x C-n`): drop a boundary marker on
+    /// its own line. Breaks the current line first if the cursor isn't at its
+    /// start, so the marker always renders as a clean rule.
+    pub fn insert_document_break(&mut self) {
+        let (_, col) = self.cursor_line_col();
+        if col != 0 {
+            self.insert_char('\n');
+        }
+        self.insert_char(Self::DOC_MARKER);
+        self.insert_char('\n');
+    }
+
     /// Delete the character before the cursor (Backspace).
     pub fn backspace(&mut self) {
-        if self.readonly || self.cursor == 0 {
+        if self.cursor == 0 {
             return;
         }
-        self.rope.remove(self.cursor - 1..self.cursor);
-        self.cursor -= 1;
+        let pos = self.cursor - 1;
+        let removed: String = self.rope.slice(pos..self.cursor).chars().collect();
+        self.rope.remove(pos..self.cursor);
+        self.cursor = pos;
+        self.journal.push(EditOp::Delete { pos, text: removed });
         self.on_edit();
     }
 
     /// Delete the character at the cursor (Delete / `C-d`).
     pub fn delete_forward(&mut self) {
-        if self.readonly || self.cursor >= self.rope.len_chars() {
+        if self.cursor >= self.rope.len_chars() {
             return;
         }
+        let removed: String = self.rope.slice(self.cursor..self.cursor + 1).chars().collect();
         self.rope.remove(self.cursor..self.cursor + 1);
+        self.journal.push(EditOp::Delete {
+            pos: self.cursor,
+            text: removed,
+        });
         self.on_edit();
     }
 
     /// Insert a string at the cursor (used by yank); advances past it.
     pub fn insert_str(&mut self, s: &str) {
-        if self.readonly || s.is_empty() {
+        if s.is_empty() {
             return;
         }
-        self.rope.insert(self.cursor, s);
+        let pos = self.cursor;
+        self.rope.insert(pos, s);
         self.cursor += s.chars().count();
+        self.journal.push(EditOp::Insert {
+            pos,
+            text: s.to_string(),
+        });
         self.on_edit();
     }
 
@@ -377,9 +382,6 @@ impl Buffer {
     /// line break itself (joining the next line). Returns the removed text so
     /// the editor can push it onto the kill ring.
     pub fn kill_line(&mut self) -> String {
-        if self.readonly {
-            return String::new();
-        }
         let (line, _) = self.cursor_line_col();
         let eol = self.rope.line_to_char(line) + self.line_char_len(line);
         let end = if self.cursor < eol {
@@ -391,15 +393,16 @@ impl Buffer {
         };
         let killed: String = self.rope.slice(self.cursor..end).chars().collect();
         self.rope.remove(self.cursor..end);
+        self.journal.push(EditOp::Delete {
+            pos: self.cursor,
+            text: killed.clone(),
+        });
         self.on_edit();
         killed
     }
 
     /// `C-w`: kill the word before the cursor. Returns the removed text.
     pub fn backward_kill_word(&mut self) -> String {
-        if self.readonly {
-            return String::new();
-        }
         let target = self.word_backward_pos();
         if target >= self.cursor {
             return String::new();
@@ -407,13 +410,16 @@ impl Buffer {
         let killed: String = self.rope.slice(target..self.cursor).chars().collect();
         self.rope.remove(target..self.cursor);
         self.cursor = target;
+        self.journal.push(EditOp::Delete {
+            pos: target,
+            text: killed.clone(),
+        });
         self.on_edit();
         killed
     }
 
     fn on_edit(&mut self) {
         self.dirty = true;
-        self.version += 1;
         self.goal_col = None;
     }
 
@@ -504,38 +510,13 @@ fn tab_advance(c: char, col: usize) -> usize {
     }
 }
 
-/// Read `path` as UTF-8, detect its EOL style, and normalise CRLF to LF for the
-/// in-memory rope.
-fn read_file(path: &Path) -> Result<(Rope, Eol)> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let eol = if text.contains("\r\n") { Eol::Crlf } else { Eol::Lf };
-    let normalized = match eol {
-        Eol::Crlf => text.replace("\r\n", "\n"),
-        Eol::Lf => text,
-    };
-    Ok((Rope::from_str(&normalized), eol))
-}
-
-/// A hidden sibling temp path in the target's directory, so the final rename is
-/// atomic (same filesystem).
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name = OsString::from(".");
-    name.push(path.file_name().unwrap_or_else(|| OsStr::new("leap")));
-    name.push(".leap-tmp");
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Build a buffer containing `s`, cursor left at the end.
     fn buf(s: &str) -> Buffer {
-        let mut b = Buffer::open(None, false).unwrap();
+        let mut b = Buffer::from_text("", 0);
         for c in s.chars() {
             b.insert_char(c);
         }
@@ -582,7 +563,7 @@ mod tests {
     fn vertical_movement_keeps_goal_column() {
         // Long, short, long: moving down then down should return to column 5.
         let mut b = buf("abcdef\nx\nyyyyyy");
-        b.goto_line(1); // line 0
+        b.set_cursor(0);
         for _ in 0..5 {
             b.move_right(); // column 5 on the long first line
         }
@@ -607,7 +588,7 @@ mod tests {
     #[test]
     fn delete_forward_at_eol_merges_next_line() {
         let mut b = buf("ab\ncd");
-        b.goto_line(1);
+        b.set_cursor(0);
         b.move_end(); // end of "ab"
         b.delete_forward();
         assert_eq!(b.display_line(0, 0, 80), "abcd");
@@ -617,7 +598,7 @@ mod tests {
     #[test]
     fn move_end_stops_before_newline() {
         let mut b = buf("hello\nx");
-        b.goto_line(1);
+        b.set_cursor(0);
         b.move_end();
         assert_eq!(b.cursor_line_col(), (0, 5));
     }
@@ -625,9 +606,7 @@ mod tests {
     #[test]
     fn tabs_expand_for_display_and_cursor_column() {
         let b = buf("\tx"); // tab then x
-        // Tab expands to a full TAB_WIDTH at column 0.
         assert_eq!(b.display_line(0, 0, 80), "    x");
-        // Char column is 2 (tab, x); display column accounts for the expansion.
         assert_eq!(b.cursor_line_col(), (0, 2));
         assert_eq!(b.cursor_display_col(), TAB_WIDTH + 1);
     }
@@ -635,7 +614,7 @@ mod tests {
     #[test]
     fn word_movement_skips_punctuation() {
         let mut b = buf("foo, bar_baz qux");
-        b.goto_line(1); // cursor at start
+        b.set_cursor(0);
         b.move_word_forward(); // end of "foo"
         assert_eq!(b.cursor_line_col(), (0, 3));
         b.move_word_forward(); // end of "bar_baz" (underscore is a word char)
@@ -647,7 +626,7 @@ mod tests {
     #[test]
     fn kill_line_to_eol_then_newline() {
         let mut b = buf("hello world\nnext");
-        b.goto_line(1);
+        b.set_cursor(0);
         for _ in 0..6 {
             b.move_right(); // before "world"
         }
@@ -677,78 +656,95 @@ mod tests {
         assert_eq!(b.cursor_line_col(), (0, 4));
     }
 
+    // --- persistence journal --------------------------------------------
+
     #[test]
-    fn readonly_buffer_rejects_edits() {
-        let mut b = Buffer::open(None, true).unwrap();
-        b.insert_char('x');
-        b.backspace();
-        assert_eq!(b.len_lines(), 1);
-        assert_eq!(b.cursor_line_col(), (0, 0));
+    fn from_text_starts_clean_with_no_journal() {
+        let mut b = Buffer::from_text("hello\nworld", 3);
+        assert_eq!(b.cursor_line_col(), (0, 3));
         assert!(!b.is_dirty());
-    }
-
-    // --- file I/O --------------------------------------------------------
-
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// A unique temp path per call, scoped to the test process.
-    fn temp_file(tag: &str) -> PathBuf {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("leap_test_{}_{tag}_{n}", std::process::id()))
+        assert!(b.take_journal().is_empty());
     }
 
     #[test]
-    fn save_as_then_reopen_roundtrips() {
-        let path = temp_file("roundtrip");
-        let mut b = buf("hello\nworld");
-        assert!(b.is_dirty());
-        b.save_as(path.clone()).unwrap();
-        assert!(!b.is_dirty(), "save clears the dirty flag");
-        assert_eq!(b.path(), Some(path.as_path()));
-
-        let reopened = Buffer::open(Some(path.clone()), false).unwrap();
-        assert_eq!(reopened.display_line(0, 0, 80), "hello");
-        assert_eq!(reopened.display_line(1, 0, 80), "world");
-        fs::remove_file(&path).ok();
+    fn edits_are_journalled_as_ops() {
+        let mut b = Buffer::from_text("abc", 3);
+        b.insert_char('d'); // Insert at 3
+        b.backspace(); // Delete at 3
+        b.set_cursor(0);
+        b.delete_forward(); // Delete at 0 ("a")
+        let ops = b.take_journal();
+        assert_eq!(
+            ops,
+            vec![
+                EditOp::Insert { pos: 3, text: "d".into() },
+                EditOp::Delete { pos: 3, text: "d".into() },
+                EditOp::Delete { pos: 0, text: "a".into() },
+            ]
+        );
+        // Draining empties the journal.
+        assert!(b.take_journal().is_empty());
     }
 
     #[test]
-    fn save_writes_exact_bytes() {
-        let path = temp_file("bytes");
-        let mut b = buf("ab\ncd");
-        b.save_as(path.clone()).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "ab\ncd");
-        fs::remove_file(&path).ok();
+    fn journal_replays_to_same_text() {
+        // The ops a buffer emits, applied to a String, reproduce its content.
+        let mut b = Buffer::from_text("", 0);
+        for c in "héllo".chars() {
+            b.insert_char(c);
+        }
+        b.set_cursor(2);
+        b.insert_str("XY");
+        let mut s = String::new();
+        for op in b.take_journal() {
+            match op {
+                EditOp::Insert { pos, text } => {
+                    let at = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
+                    s.insert_str(at, &text);
+                }
+                EditOp::Delete { .. } => unreachable!(),
+            }
+        }
+        assert_eq!(s, "héXYllo");
+    }
+
+    // --- document boundaries --------------------------------------------
+
+    #[test]
+    fn document_start_navigation_steps_between_docs() {
+        // Two markers → three documents: "one", "two", "three".
+        let mut b = Buffer::from_text("one\u{1e}\ntwo\u{1e}\nthree", 0);
+        let doc2 = b.next_document_start().unwrap();
+        b.set_cursor(doc2);
+        assert_eq!(b.document_title(40), "two");
+        let doc3 = b.next_document_start().unwrap();
+        b.set_cursor(doc3);
+        assert_eq!(b.document_title(40), "three");
+        assert_eq!(b.next_document_start(), None, "last document");
+        // Back up: into doc 2, then doc 1.
+        b.set_cursor(b.prev_document_start().unwrap());
+        assert_eq!(b.document_title(40), "two");
+        b.set_cursor(b.prev_document_start().unwrap());
+        assert_eq!(b.document_title(40), "one");
+        assert_eq!(b.prev_document_start(), None, "first document");
     }
 
     #[test]
-    fn crlf_is_normalized_in_memory_and_restored_on_save() {
-        let path = temp_file("crlf");
-        fs::write(&path, b"a\r\nb\r\nc").unwrap();
-        let mut b = Buffer::open(Some(path.clone()), false).unwrap();
-        // In memory the lines are clean (no stray '\r').
-        assert_eq!(b.display_line(0, 0, 80), "a");
-        assert_eq!(b.eol, Eol::Crlf);
-        // Edit and save: CRLF endings come back.
-        b.goto_line(b.len_lines());
-        b.move_end();
-        b.insert_char('!');
-        b.save().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"a\r\nb\r\nc!");
-        fs::remove_file(&path).ok();
+    fn marker_lines_are_recognised_and_hidden() {
+        let b = Buffer::from_text("a\n\u{1e}\nb", 0);
+        assert!(b.line_is_marker(1));
+        assert!(!b.line_is_marker(0));
+        // The marker never renders as a raw control char.
+        assert_eq!(b.display_line(1, 0, 80), "");
     }
 
     #[test]
-    fn load_missing_file_starts_empty_new() {
-        let path = temp_file("missing");
-        let mut b = buf("scratch contents");
-        let existed = b.load(&path).unwrap();
-        assert!(!existed);
-        assert_eq!(b.len_lines(), 1);
-        assert_eq!(b.cursor_line_col(), (0, 0));
-        assert!(!b.is_dirty());
-        assert_eq!(b.path(), Some(path.as_path()));
+    fn insert_document_break_drops_a_marker_line() {
+        // Mid-line: the line is broken first so the marker sits on its own line.
+        let mut b = Buffer::from_text("end", 3);
+        b.insert_document_break();
+        assert!(b.line_is_marker(1));
+        assert_eq!(b.cursor_line_col(), (2, 0), "cursor starts the new document");
     }
 
     // --- search (LEAP) ---------------------------------------------------
@@ -781,18 +777,5 @@ mod tests {
         let b = buf("a\n\tx"); // line 1 is "\tx"; 'x' is at char col 1, display col TAB_WIDTH
         let x_idx = 3; // chars: a(0) \n(1) \t(2) x(3)
         assert_eq!(b.line_col_at(x_idx), (1, TAB_WIDTH));
-    }
-
-    #[test]
-    fn save_preserves_lf_eol() {
-        let path = temp_file("lf");
-        fs::write(&path, b"x\ny").unwrap();
-        let mut b = Buffer::open(Some(path.clone()), false).unwrap();
-        b.goto_line(b.len_lines());
-        b.move_end();
-        b.insert_char('z');
-        b.save().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"x\nyz");
-        fs::remove_file(&path).ok();
     }
 }

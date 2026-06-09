@@ -1,16 +1,15 @@
 //! Top-level editor state and the event loop.
 //!
 //! Buffer + diff renderer + two-row chrome (status line and a **display-only**
-//! [`Echo`] line — no modal minibuffer). File open/save go through the fzf
-//! [`finder`](crate::finder) overlay. **LEAP** (`C-s`/`C-r`, see [`crate::leap`])
-//! is incremental search-to-move. Quitting a modified buffer uses a Raskin-style
-//! **hold gesture** (hold `C-q` to discard) instead of a modal yes/no — see
-//! [`crate::hold`]. The event loop is a polled tick so the hold can fire and
-//! animate while a key is held.
+//! [`Echo`] line — no modal minibuffer). On the Canon Cat branch there are **no
+//! files**: the buffer is reconstructed from the SQLite [store](crate::store) on
+//! launch and every keystroke is persisted back, so the workspace resumes
+//! exactly where you left off. The text is one continuous stream divided into
+//! documents by boundary markers (`C-x [` / `C-x ]` to jump, `C-x C-n` for a new
+//! one). **LEAP** (`C-s`/`C-r`, see [`crate::leap`]) is incremental
+//! search-to-move. Because nothing is ever unsaved, `C-q` just quits.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -19,18 +18,12 @@ use crossterm::{cursor, queue, terminal};
 
 use crate::buffer::Buffer;
 use crate::echo::Echo;
-use crate::finder::{self, Mode, Outcome};
-use crate::hold::Hold;
 use crate::leap::{Dir, Leap};
 use crate::statusline::StatusLine;
-use crate::walk;
+use crate::store::Store;
 
-/// Loop tick: how often the hold gesture is advanced and the meter animates.
-const TICK: Duration = Duration::from_millis(50);
-/// How long `C-q` must be held to discard unsaved changes and quit.
-const QUIT_HOLD: Duration = Duration::from_millis(650);
-/// Fallback (no Kitty protocol): repeat gap taken to mean the key was released.
-const RELEASE_GAP: Duration = Duration::from_millis(200);
+/// Compact the append-only log into a snapshot once it grows past this many rows.
+const COMPACT_THRESHOLD: i64 = 2000;
 
 /// A multi-key prefix awaiting its second key (Emacs-style `C-x ...`).
 enum Prefix {
@@ -40,6 +33,12 @@ enum Prefix {
 /// The running editor: document plus viewport, chrome, and loop state.
 pub struct Editor {
     buffer: Buffer,
+    /// The persistent workspace; edits are appended here every keystroke.
+    store: Store,
+    /// Coalescing group id for the next batch of edits (bumped per keystroke).
+    group: i64,
+    /// Last `(cursor, top, left)` persisted, to avoid redundant state writes.
+    saved_state: (usize, usize, usize),
     /// First visible line (vertical scroll offset).
     top: usize,
     /// First visible display column (horizontal scroll offset).
@@ -51,8 +50,6 @@ pub struct Editor {
     prefix: Option<Prefix>,
     /// Active LEAP search session, if any.
     leap: Option<Leap>,
-    /// Hold-to-discard-and-quit gesture (replaces the yes/no quit prompt).
-    quit_hold: Hold,
     /// Kill ring (single register for now; becomes a ring + OSC 52 in M6).
     kill_ring: String,
     /// Whether the previous command was a kill, so consecutive kills accumulate
@@ -69,27 +66,24 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// Open `path` (or an empty buffer) with the cursor at `line` (1-based).
-    /// `kbd_enhanced` is whether the Kitty keyboard protocol is active.
-    pub fn open(
-        path: Option<PathBuf>,
-        line: usize,
-        readonly: bool,
-        kbd_enhanced: bool,
-    ) -> Result<Self> {
-        let mut buffer = Buffer::open(path, readonly)?;
-        buffer.goto_line(line);
+    /// Build the editor from the persistent workspace, resuming the cursor and
+    /// scroll exactly where the last session left them.
+    pub fn new(store: Store) -> Result<Self> {
+        let resume = store.resume()?;
+        let buffer = Buffer::from_text(&resume.text, resume.cursor);
         let mut echo = Echo::default();
-        echo.show("C-x C-f open · C-x C-s save · C-q quit");
+        echo.show("Type · C-s LEAP · Ctrl+PgUp/PgDn or C-x p/n: documents · M-Enter: new · C-q quit");
         Ok(Self {
             buffer,
-            top: 0,
-            left: 0,
+            store,
+            group: 0,
+            saved_state: (resume.cursor, resume.top, resume.left),
+            top: resume.top,
+            left: resume.left,
             running: true,
             echo,
             prefix: None,
             leap: None,
-            quit_hold: Hold::new(QUIT_HOLD, RELEASE_GAP, kbd_enhanced, Instant::now()),
             kill_ring: String::new(),
             last_was_kill: false,
             last_text_rows: 1,
@@ -99,49 +93,60 @@ impl Editor {
         })
     }
 
-    /// Polled event loop: handle input when present, advance the hold gesture
-    /// every tick, and repaint only when something changed (or a hold meter is
-    /// animating). Idle costs no redraws.
+    /// Event loop: handle a key, flush its edits to the store, repaint. Blocking
+    /// reads — there is no animated gesture to keep alive (quitting is instant
+    /// because the workspace is always saved).
     pub fn run(&mut self) -> Result<()> {
         self.render()?;
-        let mut prev_armed = false;
         while self.running {
-            let got = if event::poll(TICK)? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        self.on_key(key);
-                        true
-                    }
-                    Event::Resize(_, _) => true,
-                    _ => false,
+            match event::read()? {
+                Event::Key(key) => {
+                    self.on_key(key);
+                    self.persist_edits()?;
                 }
-            } else {
-                false
-            };
-
-            // Advance the hold; firing means "discard changes and quit".
-            if self.quit_hold.poll(Instant::now()) {
-                self.running = false;
+                Event::Resize(_, _) => {}
+                _ => {}
             }
-
-            let armed = self.quit_hold.is_armed();
-            if self.running && (got || armed || prev_armed) {
+            if self.running {
                 self.render()?;
             }
-            prev_armed = armed;
+        }
+        // Clean exit: a final flush + log compaction so next launch is fast.
+        self.persist_edits()?;
+        if self.store.edit_count()? > COMPACT_THRESHOLD {
+            let text = self.buffer_text();
+            self.store.snapshot(&text)?;
         }
         Ok(())
     }
 
+    /// Drain the buffer's edit journal into the append-only log.
+    fn persist_edits(&mut self) -> Result<()> {
+        let ops = self.buffer.take_journal();
+        if !ops.is_empty() {
+            self.store.append(&ops, self.group)?;
+            self.group += 1;
+            self.buffer.mark_saved();
+        }
+        Ok(())
+    }
+
+    /// The full stream as a `String` (for snapshot compaction).
+    fn buffer_text(&self) -> String {
+        (0..self.buffer.len_lines())
+            .map(|l| {
+                let mut s = self.buffer.display_line(l, 0, usize::MAX);
+                s.push('\n');
+                s
+            })
+            .collect()
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
-        // Key releases (Kitty protocol only) end hold gestures.
+        // Key releases (Kitty protocol) carry no command on this branch.
         if key.kind == KeyEventKind::Release {
-            if matches!(key.code, KeyCode::Char('q')) {
-                self.quit_hold.release();
-            }
             return;
         }
-        // Press or auto-repeat below (repeats drive held-key gestures).
 
         // A LEAP session is active: keystrokes drive the search, not the buffer.
         if self.leap.is_some() {
@@ -168,7 +173,7 @@ impl Editor {
 
         match key.code {
             // ---- quit / prefix / cancel ------------------------------------
-            KeyCode::Char('q') if ctrl => self.quit_key(),
+            KeyCode::Char('q') if ctrl => self.running = false,
             KeyCode::Char('x') if ctrl => {
                 self.prefix = Some(Prefix::CtrlX);
                 self.echo.show("C-x-");
@@ -191,6 +196,8 @@ impl Editor {
             KeyCode::Char('f') if alt => self.buffer.move_word_forward(),
             KeyCode::Char('v') if ctrl => self.page_down(),
             KeyCode::Char('v') if alt => self.page_up(),
+            // C-l: redraw and center the cursor's line (Emacs recenter).
+            KeyCode::Char('l') if ctrl => self.recenter(),
 
             // ---- Emacs editing ---------------------------------------------
             KeyCode::Char('d') if ctrl => self.edit(Buffer::delete_forward),
@@ -206,6 +213,18 @@ impl Editor {
             KeyCode::Down => self.buffer.move_down(),
             KeyCode::Home => self.buffer.move_home(),
             KeyCode::End => self.buffer.move_end(),
+
+            // ---- right-thumb cluster: page, or jump documents with Ctrl -----
+            KeyCode::PageUp if ctrl => self.prev_document(),
+            KeyCode::PageDown if ctrl => self.next_document(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
+
+            // M-Enter starts a new document (must precede the plain Enter arm).
+            KeyCode::Enter if alt => {
+                self.edit(Buffer::insert_document_break);
+                self.echo.show("New document");
+            }
             KeyCode::Enter => self.edit(Buffer::insert_newline),
             KeyCode::Tab => self.edit(|b| b.insert_char('\t')),
             KeyCode::Backspace => self.edit(Buffer::backspace),
@@ -221,10 +240,6 @@ impl Editor {
     /// kill (`C-w`) prepends so the recovered text keeps document order; a
     /// forward kill (`C-k`) appends.
     fn kill<F: FnOnce(&mut Buffer) -> String>(&mut self, f: F, backward: bool) {
-        if self.buffer.readonly() {
-            self.echo.show("Buffer is read-only");
-            return;
-        }
         let killed = f(&mut self.buffer);
         match (self.last_was_kill, backward) {
             (true, true) => self.kill_ring.insert_str(0, &killed),
@@ -236,12 +251,11 @@ impl Editor {
 
     /// `C-y`: insert the kill ring at the cursor.
     fn yank(&mut self) {
-        if self.buffer.readonly() {
-            self.echo.show("Buffer is read-only");
-        } else if self.kill_ring.is_empty() {
+        if self.kill_ring.is_empty() {
             self.echo.show("Kill ring empty");
         } else {
-            self.buffer.insert_str(&self.kill_ring);
+            let text = self.kill_ring.clone();
+            self.buffer.insert_str(&text);
         }
     }
 
@@ -262,13 +276,19 @@ impl Editor {
         self.last_text_rows.saturating_sub(1).max(1)
     }
 
-    /// Run a mutating edit, or report why it can't happen in the echo area.
+    /// `C-l`: scroll so the cursor's line sits in the middle of the text area,
+    /// and force a full repaint (clears any terminal glitches). Like Emacs
+    /// `recenter`. `scroll_to_cursor` leaves `top` alone since the cursor is now
+    /// comfortably on screen.
+    fn recenter(&mut self) {
+        let (line, _) = self.buffer.cursor_line_col();
+        self.top = line.saturating_sub(self.last_text_rows / 2);
+        self.frame_cols = 0; // invalidate the diff cache → clear-and-repaint
+    }
+
+    /// Run a mutating edit on the buffer.
     fn edit<F: FnOnce(&mut Buffer)>(&mut self, f: F) {
-        if self.buffer.readonly() {
-            self.echo.show("Buffer is read-only");
-        } else {
-            f(&mut self.buffer);
-        }
+        f(&mut self.buffer);
     }
 
     /// Complete a pending prefix key (currently only `C-x`).
@@ -276,19 +296,12 @@ impl Editor {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match prefix {
             Prefix::CtrlX => match key.code {
-                KeyCode::Char('s') if ctrl => self.save(),
-                KeyCode::Char('w') if ctrl => self.save_as(),
-                KeyCode::Char('f') if ctrl => self.find_file(),
-                // C-x C-c can't be "held"; on a dirty buffer it points at the
-                // C-q hold gesture rather than quitting.
-                KeyCode::Char('c') if ctrl => {
-                    if self.buffer.is_dirty() {
-                        self.echo
-                            .show("Unsaved changes — hold C-q to discard, or C-x C-s to save");
-                    } else {
-                        self.running = false;
-                    }
-                }
+                // Document jumps mirror C-p / C-n; brackets avoided (deep layer
+                // on the Ergodox). Single-chord equivalents are Ctrl+PgUp/PgDn.
+                KeyCode::Char('p') => self.prev_document(),
+                KeyCode::Char('n') => self.next_document(),
+                // C-x C-c: quit (everything is already saved).
+                KeyCode::Char('c') if ctrl => self.running = false,
                 KeyCode::Char('g') if ctrl => self.echo.show("Cancelled"),
                 KeyCode::Esc => self.echo.show("Cancelled"),
                 _ => self.echo.show("C-x: undefined key"),
@@ -296,65 +309,38 @@ impl Editor {
         }
     }
 
-    /// `C-q`: quit immediately when clean; on a dirty buffer, arm the
-    /// hold-to-discard gesture (a tap just shows the hint, a sustained hold
-    /// fills the meter and quits). No modal yes/no.
-    fn quit_key(&mut self) {
-        if self.buffer.is_dirty() {
-            self.echo
-                .show("Unsaved changes — hold C-q to discard, or C-x C-s to save");
-            self.quit_hold.press(Instant::now());
+    /// `C-x [`: move to the start of the current document, then to earlier ones.
+    fn prev_document(&mut self) {
+        let start = self.buffer.current_document_start();
+        if self.buffer.cursor() > start {
+            self.buffer.set_cursor(start);
+            self.echo.show(self.doc_label());
+        } else if let Some(p) = self.buffer.prev_document_start() {
+            self.buffer.set_cursor(p);
+            self.echo.show(self.doc_label());
         } else {
-            self.running = false;
+            self.echo.show("First document");
         }
     }
 
-    /// Run the fzf finder over the project, then force a full repaint (it
-    /// clobbered the screen). Errors surface on the echo line.
-    fn run_finder(&mut self, mode: Mode, seed: &str) -> Outcome {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let root = walk::finder_root(&cwd);
-        let outcome = match finder::run(mode, &root, seed) {
-            Ok(o) => o,
-            Err(e) => {
-                self.echo.show(format!("Finder error: {e}"));
-                Outcome::Cancel
+    /// `C-x ]`: move to the start of the next document.
+    fn next_document(&mut self) {
+        match self.buffer.next_document_start() {
+            Some(p) => {
+                self.buffer.set_cursor(p);
+                self.echo.show(self.doc_label());
             }
-        };
-        self.frame_cols = 0; // invalidate the diff cache → clear-and-repaint
-        outcome
-    }
-
-    /// `C-x C-f`: open another file via the finder. Refuses to discard unsaved
-    /// changes — save first.
-    fn find_file(&mut self) {
-        if self.buffer.is_dirty() {
-            self.echo.show("Unsaved changes — save first (C-x C-s)");
-            return;
-        }
-        match self.run_finder(Mode::Open, "") {
-            Outcome::Open(path) => match self.buffer.load(&path) {
-                Ok(_) => {
-                    self.top = 0;
-                    self.left = 0;
-                    self.echo.show(format!("Opened {}", self.buffer_name()));
-                }
-                Err(e) => self.echo.show(format!("Open failed: {e}")),
-            },
-            Outcome::Quit => self.quit_from_finder(),
-            Outcome::Cancel | Outcome::Save(_) => {}
+            None => self.echo.show("Last document"),
         }
     }
 
-    /// `C-q` pressed inside the finder: quit the editor if the buffer is clean
-    /// (the common case), else bounce back with the hold-to-discard hint — we
-    /// never silently drop unsaved changes.
-    fn quit_from_finder(&mut self) {
-        if self.buffer.is_dirty() {
-            self.echo
-                .show("Unsaved changes — hold C-q to discard, or C-x C-s to save");
+    /// A short label for the document the cursor is in (its leading text).
+    fn doc_label(&self) -> String {
+        let title = self.buffer.document_title(40);
+        if title.is_empty() {
+            "Untitled document".to_string()
         } else {
-            self.running = false;
+            format!("Document: {title}")
         }
     }
 
@@ -479,45 +465,6 @@ impl Editor {
         self.echo.show("Quit");
     }
 
-    /// `C-x C-s`: save to the current path, or pick a name via the finder.
-    fn save(&mut self) {
-        if self.buffer.path().is_none() {
-            self.save_as();
-            return;
-        }
-        match self.buffer.save() {
-            Ok(()) => self.echo.show(format!("Saved {}", self.buffer_name())),
-            Err(e) => self.echo.show(format!("Save failed: {e}")),
-        }
-    }
-
-    /// `C-x C-w`: choose a path via the finder (typed query = path) and save.
-    fn save_as(&mut self) {
-        let seed = self
-            .buffer
-            .path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        match self.run_finder(Mode::Save, &seed) {
-            Outcome::Save(path) => match self.buffer.save_as(path) {
-                Ok(()) => self.echo.show(format!("Saved {}", self.buffer_name())),
-                Err(e) => self.echo.show(format!("Save failed: {e}")),
-            },
-            Outcome::Cancel => self.echo.show("Cancelled"),
-            Outcome::Quit => self.quit_from_finder(),
-            Outcome::Open(_) => {}
-        }
-    }
-
-    /// The current file's display name (file name, or "*scratch*").
-    fn buffer_name(&self) -> String {
-        self.buffer
-            .path()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "*scratch*".to_string())
-    }
-
     /// Adjust the viewport so the cursor stays on screen.
     fn scroll_to_cursor(&mut self, text_rows: usize, text_cols: usize) {
         let (line, _) = self.buffer.cursor_line_col();
@@ -537,13 +484,20 @@ impl Editor {
 
     fn render(&mut self) -> Result<()> {
         let (cols, rows) = terminal::size()?;
-        // Bottom two rows are chrome: status line, then the minibuffer.
+        // Bottom two rows are chrome: status line, then the echo line.
         let text_rows = rows.saturating_sub(2) as usize;
         let text_cols = cols as usize;
         let status_row = rows.saturating_sub(2);
         let mini_row = rows.saturating_sub(1);
         self.last_text_rows = text_rows; // for page up/down
         self.scroll_to_cursor(text_rows, text_cols);
+
+        // Persist the resume position whenever it moves (cheap single-row write).
+        let st = (self.buffer.cursor(), self.top, self.left);
+        if st != self.saved_state {
+            self.store.set_state(st.0, st.1, st.2)?;
+            self.saved_state = st;
+        }
 
         let mut out = io::stdout();
 
@@ -571,10 +525,12 @@ impl Editor {
         // Text area: only repaint rows whose content changed (or all, leaping).
         for row in 0..text_rows {
             let idx = self.top + row;
-            let desired = if idx < self.buffer.len_lines() {
-                self.buffer.display_line(idx, self.left, text_cols)
-            } else {
+            let desired = if idx >= self.buffer.len_lines() {
                 "~".to_string()
+            } else if self.buffer.line_is_marker(idx) {
+                marker_rule(text_cols)
+            } else {
+                self.buffer.display_line(idx, self.left, text_cols)
             };
             match leap_hl {
                 Some((line, lo, hi)) if line == idx => {
@@ -588,13 +544,10 @@ impl Editor {
         let status = self.status_string(text_cols);
         self.draw_row(&mut out, status_row, status, text_cols, true)?;
 
-        // Echo line. Priority: hold meter > LEAP label > transient message.
-        let echo_line = match self.quit_hold.progress(Instant::now()) {
-            Some(frac) => format!("Hold C-q to discard changes  {}", meter(frac)),
-            None => match &self.leap {
-                Some(l) => l.label().chars().take(text_cols).collect(),
-                None => self.echo.render(text_cols),
-            },
+        // Echo line. Priority: LEAP label > transient message.
+        let echo_line = match &self.leap {
+            Some(l) => l.label().chars().take(text_cols).collect(),
+            None => self.echo.render(text_cols),
         };
         self.draw_row(&mut out, mini_row, echo_line, text_cols, false)?;
 
@@ -687,11 +640,19 @@ impl Editor {
 
     fn status_string(&self, width: usize) -> String {
         let (line, col) = self.buffer.cursor_line_col();
+        let title = self.buffer.document_title(40);
+        let name = if title.is_empty() {
+            "·leap·".to_string()
+        } else {
+            title
+        };
 
         StatusLine {
-            name: self.buffer_name(),
+            name,
+            // Every keystroke is persisted before we render, so this is in
+            // practice always false — the Cat never shows "unsaved".
             dirty: self.buffer.is_dirty(),
-            readonly: self.buffer.readonly(),
+            readonly: false,
             line: line + 1,
             col: col + 1,
             total_lines: self.buffer.len_lines(),
@@ -700,9 +661,7 @@ impl Editor {
     }
 }
 
-/// A 5-cell progress meter (`▰`/`▱`) for a hold gesture.
-fn meter(frac: f32) -> String {
-    const CELLS: usize = 5;
-    let filled = (frac.clamp(0.0, 1.0) * CELLS as f32).round() as usize;
-    (0..CELLS).map(|i| if i < filled { '▰' } else { '▱' }).collect()
+/// A full-width horizontal rule drawn in place of a document-boundary marker line.
+fn marker_rule(width: usize) -> String {
+    "─".repeat(width)
 }

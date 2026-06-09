@@ -5,8 +5,7 @@
 //! via an installed hook, so a crash never leaves the user's terminal wedged.
 //!
 //! It also negotiates the **Kitty keyboard protocol** where available, so held
-//! keys report real release/repeat events (exact hold gestures and, later,
-//! hold-to-LEAP). [`TerminalGuard::kbd_enhanced`] reports whether it took.
+//! keys report real release/repeat events (for future hold-to-confirm gestures).
 
 use std::io::{self, Write};
 
@@ -22,17 +21,7 @@ use crossterm::{
 };
 
 /// Restores the terminal to its normal state when dropped.
-pub struct TerminalGuard {
-    kbd_enhanced: bool,
-}
-
-impl TerminalGuard {
-    /// Whether the Kitty keyboard protocol is active (real key release/repeat
-    /// events are delivered).
-    pub fn kbd_enhanced(&self) -> bool {
-        self.kbd_enhanced
-    }
-}
+pub struct TerminalGuard;
 
 /// Enter raw mode + the alternate screen and negotiate keyboard enhancement.
 /// The returned guard restores the terminal when it goes out of scope.
@@ -42,15 +31,14 @@ pub fn setup() -> Result<TerminalGuard> {
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen, cursor::Hide)?;
 
-    let kbd_enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
-    if kbd_enhanced {
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
         // DISAMBIGUATE_ESCAPE_CODES so modified keys arrive cleanly as CSI-u;
         // REPORT_EVENT_TYPES so we get Press/Repeat/Release rather than just Press.
         let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
             | KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
         let _ = execute!(out, PushKeyboardEnhancementFlags(flags));
     }
-    Ok(TerminalGuard { kbd_enhanced })
+    Ok(TerminalGuard)
 }
 
 impl Drop for TerminalGuard {
