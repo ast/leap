@@ -102,7 +102,8 @@ impl Tui {
         let (cols, rows) = terminal::size()?;
         let frame = self.editor.compute_frame(cols as usize, rows as usize)?;
         let text_cols = cols as usize;
-        let text_rows = rows.saturating_sub(2) as usize;
+        let text_rows = rows.saturating_sub(3) as usize;
+        let ruler_row = rows.saturating_sub(3);
         let status_row = rows.saturating_sub(2);
         let mini_row = rows.saturating_sub(1);
 
@@ -138,7 +139,10 @@ impl Tui {
             }
         }
 
-        // Chrome: status line (reverse video), then the echo line.
+        // Chrome: ruler (with a reverse-video marker at the cursor column),
+        // status line (reverse video), then the echo line.
+        let (ccol, _) = frame.cursor;
+        self.draw_row_highlight(&mut out, ruler_row, &frame.ruler, ccol, ccol + 1, text_cols)?;
         self.draw_row(&mut out, status_row, frame.status.clone(), text_cols, true)?;
         self.draw_row(&mut out, mini_row, frame.echo.clone(), text_cols, false)?;
 

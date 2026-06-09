@@ -58,6 +58,10 @@ DOCUMENTS
   M-Enter                 start a NEW document here (drops a fresh boundary)
   Or just LEAP to a document by typing a word from its first line.
 
+THE RULER
+  The scale just below the text counts character columns (the digits mark every
+  tenth column). The blinking mark on it tracks your cursor's column.
+
 QUITTING
   C-q          quit. (Your work is already saved — nothing is discarded.)
 

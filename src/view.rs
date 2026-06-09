@@ -42,12 +42,14 @@ pub struct FrameMeta {
 /// A complete, render-ready snapshot of the editor for one frame, in cells.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Frame {
-    /// Exactly `text_rows` entries (viewport height minus the two chrome rows).
+    /// Exactly `text_rows` entries (viewport height minus the three chrome rows).
     pub rows: Vec<Row>,
     /// The status line, formatted to the full width.
     pub status: String,
     /// The echo line (LEAP label or a transient message), clipped to width.
     pub echo: String,
+    /// The ruler scale (cursor marker drawn by the front-end).
+    pub ruler: String,
     /// Cursor position in cells, viewport-relative: `(col, row)`.
     pub cursor: (usize, usize),
     /// Per-text-row inverse highlight (selection or LEAP match): one entry per

@@ -15,6 +15,7 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
+use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use super::font::{self, CellMetrics};
@@ -152,6 +153,34 @@ fn push_rect(verts: &mut Vec<QuadVertex>, rect: [f32; 4], screen: [f32; 2], colo
     }
 }
 
+/// Build the graphical ruler tick marks (quad geometry) for a surface: a short
+/// tick per column, taller every 5, tallest every 10, bottom-aligned on the
+/// ruler row. Generated once per resize/scale and cached in a vertex buffer.
+fn ruler_verts(width: u32, height: u32, cell: CellMetrics, scale: f32) -> Vec<QuadVertex> {
+    let (w, h) = (width as f32, height as f32);
+    let (adv, lh) = (cell.advance, cell.line_height);
+    let rows = (h / lh).floor() as usize;
+    let ruler_y = rows.saturating_sub(3) as f32 * lh; // ruler is the first chrome row
+    let screen = [w, h];
+    let ink = linear(INK);
+    let tw = scale.max(1.0); // tick width in px
+    let cols = (w / adv).floor() as usize;
+    let mut verts = Vec::with_capacity((cols + 1) * 6);
+    for c in 0..=cols {
+        let level = if c.is_multiple_of(10) {
+            0.70
+        } else if c.is_multiple_of(5) {
+            0.45
+        } else {
+            0.22
+        };
+        let th = lh * level;
+        let x = c as f32 * adv + adv / 2.0 - tw / 2.0;
+        push_rect(&mut verts, [x, ruler_y + lh - th, x + tw, ruler_y + lh], screen, ink);
+    }
+    verts
+}
+
 // --- GPU state ------------------------------------------------------------
 
 /// The GPU surface, glyph renderer, and the solid-quad pipeline.
@@ -168,6 +197,9 @@ pub struct Gpu {
     text_buffer: Buffer,
     quad_pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
+    /// Cached graphical-ruler tick geometry (rebuilt only on resize/scale).
+    ruler_quad_buffer: wgpu::Buffer,
+    ruler_quad_verts: u32,
     metrics: Metrics,
     cell: CellMetrics,
     scale: f32,
@@ -269,6 +301,14 @@ impl Gpu {
         text_buffer.set_hinting(&mut font_system, Hinting::Enabled);
         text_buffer.set_monospace_width(&mut font_system, Some(cell.advance));
 
+        let ruler_init = ruler_verts(config.width, config.height, cell, scale);
+        let ruler_quad_verts = ruler_init.len() as u32;
+        let ruler_quad_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("leap-gui ruler"),
+            contents: bytemuck::cast_slice(&ruler_init),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -282,6 +322,8 @@ impl Gpu {
             text_buffer,
             quad_pipeline,
             quad_buffer,
+            ruler_quad_buffer,
+            ruler_quad_verts,
             metrics,
             cell,
             scale,
@@ -305,6 +347,18 @@ impl Gpu {
         self.text_buffer.set_metrics(&mut self.font_system, self.metrics);
         self.text_buffer
             .set_monospace_width(&mut self.font_system, Some(self.cell.advance));
+        self.rebuild_ruler();
+    }
+
+    /// Regenerate the cached ruler tick geometry (after a resize or scale change).
+    fn rebuild_ruler(&mut self) {
+        let verts = ruler_verts(self.config.width, self.config.height, self.cell, self.scale);
+        self.ruler_quad_verts = verts.len() as u32;
+        self.ruler_quad_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("leap-gui ruler"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
     }
 
     /// Reconfigure the surface after a window resize (clamped to the GPU's max
@@ -313,6 +367,7 @@ impl Gpu {
         self.config.width = width.clamp(1, self.max_dim);
         self.config.height = height.clamp(1, self.max_dim);
         self.surface.configure(&self.device, &self.config);
+        self.rebuild_ruler();
     }
 
     /// Viewport size in character cells for the current surface + font.
@@ -391,14 +446,26 @@ impl Gpu {
             reshaped = true;
         }
 
-        // Inverse ink rectangles: status bar, highlight spans, cursor block.
+        // Chrome rows: ruler, then the status bar, then echo.
+        let ruler_y = text_rows as f32 * lh;
+        let status_y = (text_rows as f32 + 1.0) * lh;
+        let echo_y = (text_rows as f32 + 2.0) * lh;
+
+        // Inverse ink rectangles: status bar, highlight spans, ruler marker, cursor.
         let ink_lin = linear(INK);
         let mut quads: Vec<QuadVertex> = Vec::with_capacity(QUAD_CAPACITY * 6);
-        push_rect(&mut quads, [0.0, text_rows as f32 * lh, w, (text_rows as f32 + 1.0) * lh], screen, ink_lin);
+        push_rect(&mut quads, [0.0, status_y, w, status_y + lh], screen, ink_lin);
         for s in scene.spans {
             push_rect(&mut quads, [s.x, s.y, s.x + s.width, s.y + lh], screen, ink_lin);
         }
         let (cur_x, cur_y) = scene.cursor_px;
+        // The Cat's blinking column indicator: a thin vertical line through the
+        // ruler row, centered on the cursor's column, blinking with the cursor.
+        if scene.cursor_visible {
+            let mw = (self.scale * 1.5).max(1.5);
+            let mx = cur_x + adv / 2.0 - mw / 2.0;
+            push_rect(&mut quads, [mx, ruler_y, mx + mw, ruler_y + lh], screen, ink_lin);
+        }
         if !composing {
             // Solid erase highlight (the character to the left).
             if let Some((hx, hy)) = scene.highlight_px {
@@ -463,8 +530,8 @@ impl Gpu {
         let body_bounds = TextBounds { left: 0, top: 0, right: self.config.width as i32, bottom: (text_rows as f32 * lh) as i32 };
         let mut areas = vec![
             TextArea { buffer: &self.text_buffer, left: 0.0, top: scene.body_top_px, scale: 1.0, bounds: body_bounds, default_color: color(INK), custom_glyphs: &[] },
-            TextArea { buffer: &status_buf, left: 0.0, top: text_rows as f32 * lh, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] },
-            TextArea { buffer: &echo_buf, left: 0.0, top: (text_rows as f32 + 1.0) * lh, scale: 1.0, bounds, default_color: color(INK), custom_glyphs: &[] },
+            TextArea { buffer: &status_buf, left: 0.0, top: status_y, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] },
+            TextArea { buffer: &echo_buf, left: 0.0, top: echo_y, scale: 1.0, bounds, default_color: color(INK), custom_glyphs: &[] },
         ];
         for (buf, left, top) in &span_bufs {
             areas.push(TextArea { buffer: buf, left: *left, top: *top, scale: 1.0, bounds, default_color: color(PAPER), custom_glyphs: &[] });
@@ -512,10 +579,13 @@ impl Gpu {
                 multiview_mask: None,
             });
 
-            // Inverse backgrounds first, then the text (paper overlays on top).
+            // Inverse backgrounds first, then the cached graphical ruler ticks,
+            // then the text (paper overlays on top).
             pass.set_pipeline(&self.quad_pipeline);
             pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
             pass.draw(0..quad_verts, 0..1);
+            pass.set_vertex_buffer(0, self.ruler_quad_buffer.slice(..));
+            pass.draw(0..self.ruler_quad_verts, 0..1);
 
             self.text_renderer.render(&self.atlas, &self.viewport, &mut pass)?;
         }

@@ -595,6 +595,7 @@ impl Editor {
             rows,
             status: m.status,
             echo: m.echo,
+            ruler: self.ruler_string(m.left, cols),
             cursor: m.cursor,
             highlights,
             full_repaint: m.full_repaint,
@@ -608,7 +609,8 @@ impl Editor {
     /// the row-construction logic lives in one place and the GUI doesn't build
     /// rows twice. `cols`/`rows` are the viewport size in cells.
     pub fn tick(&mut self, cols: usize, rows: usize) -> Result<FrameMeta> {
-        let text_rows = rows.saturating_sub(2);
+        // Three chrome rows at the bottom: ruler, status, echo.
+        let text_rows = rows.saturating_sub(3);
         self.last_text_rows = text_rows; // for page up/down
         self.scroll_to_cursor(text_rows, cols);
 
@@ -641,6 +643,24 @@ impl Editor {
             full_repaint: std::mem::take(&mut self.force_repaint),
             redraw_text: self.leap.is_some(),
         })
+    }
+
+    /// The Canon Cat ruler: a character scale for the visible columns — `-`
+    /// ticks, `+` every 5, and the tens digit every 10 (so `10`→`1`, `80`→`8`).
+    /// The front-end overlays the blinking column indicator at the cursor.
+    fn ruler_string(&self, left: usize, width: usize) -> String {
+        (0..width)
+            .map(|c| {
+                let col = left + c;
+                if col > 0 && col.is_multiple_of(10) {
+                    std::char::from_digit((col / 10 % 10) as u32, 10).unwrap_or('-')
+                } else if col.is_multiple_of(5) {
+                    '+'
+                } else {
+                    '-'
+                }
+            })
+            .collect()
     }
 
     /// One display row at absolute line `idx`, scrolled by `left`, clipped to
@@ -860,7 +880,8 @@ mod tests {
         assert!(e.buffer.selection().is_some());
         // 10-row viewport over a 2-line buffer → rows past the end are queried.
         let f = e.compute_frame(20, 10).unwrap();
-        assert_eq!(f.highlights.len(), 8);
+        assert_eq!(f.highlights.len(), 7); // 10 rows − 3 chrome rows
+
         // Directly hit a past-end row too.
         assert_eq!(e.row_highlight(50, 0, 20), None);
     }
@@ -878,12 +899,13 @@ mod tests {
     #[test]
     fn compute_frame_lays_out_rows_status_and_cursor() {
         let mut e = editor_with("one\ntwo\nthree");
-        // 5 rows total → 3 text rows + status + echo.
-        let f = e.compute_frame(20, 5).unwrap();
+        // 6 rows total → 3 text rows + ruler + status + echo.
+        let f = e.compute_frame(20, 6).unwrap();
         assert_eq!(f.rows.len(), 3);
         assert_eq!(f.rows[0], Row::Text("one".into()));
         assert_eq!(f.rows[1], Row::Text("two".into()));
         assert!(f.status.contains("Ln 1"));
+        assert!(!f.ruler.is_empty());
         assert_eq!(f.cursor, (0, 0));
     }
 
