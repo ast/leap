@@ -210,8 +210,11 @@ impl App {
             return;
         };
         let (cols, rows) = gpu.grid();
-        let frame = match self.editor.compute_frame(cols, rows) {
-            Ok(f) => f,
+        // `tick` advances the view + persists state and returns metadata; the GUI
+        // builds rows itself via `rows_at` (around the animated scroll), so rows
+        // aren't constructed twice.
+        let meta = match self.editor.tick(cols, rows) {
+            Ok(m) => m,
             Err(e) => {
                 eprintln!("leap-gui: frame error: {e}");
                 return;
@@ -219,9 +222,9 @@ impl App {
         };
         let lh = gpu.line_height();
         let adv = gpu.advance();
-        let text_rows = rows.saturating_sub(2);
-        let left = self.editor.view_left();
-        let top = self.editor.view_top();
+        let text_rows = meta.text_rows;
+        let left = meta.left;
+        let top = meta.top;
 
         // Ease the pixel scroll toward the target top line.
         let target = top as f32 * lh;
@@ -237,8 +240,8 @@ impl App {
 
         // Canon Cat two-part cursor, glued to the scroll so the blocks + inverse
         // glyphs share the fractional offset.
-        let cursor_line = top + frame.cursor.1;
-        let cursor_col = frame.cursor.0;
+        let cursor_line = top + meta.cursor.1;
+        let cursor_col = meta.cursor.0;
         let cursor_y = cursor_line as f32 * lh - scroll_px;
         let cursor_px = (cursor_col as f32 * adv, cursor_y);
         let row_text = body.get(cursor_line.saturating_sub(first));
@@ -258,7 +261,7 @@ impl App {
         self.blink_drawn = cursor_visible;
 
         // LEAP highlight placed in the animated window.
-        let leap = frame.leap_hl.map(|(rel, s, e)| {
+        let leap = meta.leap_hl.map(|(rel, s, e)| {
             let line = top + rel;
             let matched: String = match body.get(line.saturating_sub(first)) {
                 Some(Row::Text(t)) => t.chars().skip(s).take(e.saturating_sub(s)).collect(),
@@ -276,8 +279,8 @@ impl App {
             rows: &body,
             body_top_px,
             text_rows,
-            status: &frame.status,
-            echo: &frame.echo,
+            status: &meta.status,
+            echo: &meta.echo,
             cursor_px,
             cursor_glyph: cursor_glyph.as_deref(),
             cursor_visible,

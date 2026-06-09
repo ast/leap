@@ -15,6 +15,8 @@
 //! in two flavours: **char columns** (used for movement and the status line) and
 //! **display columns** (tabs expanded), used for rendering and scrolling.
 
+use std::cell::RefCell;
+
 use ropey::Rope;
 
 use crate::store::EditOp;
@@ -34,6 +36,10 @@ pub struct Buffer {
     dirty: bool,
     /// Edits applied since the last drain, in apply order, awaiting persistence.
     journal: Vec<EditOp>,
+    /// Lazily materialized rope text (`rope.chunks().collect()`), reused across
+    /// reads within a session and invalidated on edit — so a LEAP keystroke
+    /// doesn't re-collect the whole buffer every time.
+    text_cache: RefCell<Option<String>>,
 }
 
 impl Buffer {
@@ -47,6 +53,7 @@ impl Buffer {
             goal_col: None,
             dirty: false,
             journal: Vec::new(),
+            text_cache: RefCell::new(None),
         }
     }
 
@@ -114,9 +121,9 @@ impl Buffer {
         if needle.is_empty() {
             return None;
         }
-        let text: String = self.rope.chunks().collect();
         let from_byte = self.rope.char_to_byte(from);
-        find_from(&text, needle, from_byte, insensitive).map(|b| self.rope.byte_to_char(b))
+        let byte = self.with_text(|text| find_from(text, needle, from_byte, insensitive))?;
+        Some(self.rope.byte_to_char(byte))
     }
 
     /// Last match of `needle` that starts strictly before char index `before`.
@@ -124,9 +131,23 @@ impl Buffer {
         if needle.is_empty() {
             return None;
         }
-        let text: String = self.rope.chunks().collect();
         let before_byte = self.rope.char_to_byte(before);
-        find_last_before(&text, needle, before_byte, insensitive).map(|b| self.rope.byte_to_char(b))
+        let byte = self.with_text(|text| find_last_before(text, needle, before_byte, insensitive))?;
+        Some(self.rope.byte_to_char(byte))
+    }
+
+    /// The full buffer contents, exactly as stored (markers, tabs, and newlines
+    /// intact) — used for snapshot compaction. *Not* `display_line`, which would
+    /// strip document markers and expand tabs.
+    pub fn text(&self) -> String {
+        self.with_text(|s| s.to_owned())
+    }
+
+    /// Run `f` with the materialized rope text, caching it until the next edit.
+    fn with_text<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        let mut cache = self.text_cache.borrow_mut();
+        let text = cache.get_or_insert_with(|| self.rope.chunks().collect());
+        f(text)
     }
 
     /// Cursor position as `(line, char_col)`, both 0-based.
@@ -421,6 +442,7 @@ impl Buffer {
     fn on_edit(&mut self) {
         self.dirty = true;
         self.goal_col = None;
+        self.text_cache.get_mut().take(); // invalidate the materialized-text cache
     }
 
     // --- helpers ---------------------------------------------------------
@@ -748,6 +770,25 @@ mod tests {
     }
 
     // --- search (LEAP) ---------------------------------------------------
+
+    #[test]
+    fn text_is_faithful_for_snapshots() {
+        // text() must preserve document markers, tabs, and exact newlines — the
+        // old display_line-based reconstruction stripped markers + expanded tabs,
+        // corrupting snapshots on compaction.
+        let raw = "doc one\u{1e}\n\tindented\nlast";
+        let b = Buffer::from_text(raw, 0);
+        assert_eq!(b.text(), raw);
+    }
+
+    #[test]
+    fn search_cache_invalidated_on_edit() {
+        let mut b = buf("foo bar");
+        assert_eq!(b.search_forward(0, "bar", false), Some(4));
+        b.set_cursor(0);
+        b.insert_str("XX "); // shifts everything right by 3; cache must refresh
+        assert_eq!(b.search_forward(0, "bar", false), Some(7));
+    }
 
     #[test]
     fn search_forward_finds_next_match() {

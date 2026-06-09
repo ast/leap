@@ -74,6 +74,14 @@ fn color(rgb: (u8, u8, u8)) -> Color {
     Color::rgb(rgb.0, rgb.1, rgb.2)
 }
 
+/// The configured font family, or the generic monospace fallback.
+fn family_of(font_family: &Option<String>) -> Family<'_> {
+    match font_family {
+        Some(name) => Family::Name(name),
+        None => Family::Monospace,
+    }
+}
+
 /// sRGB byte → linear float, for clear color and quad fills on an sRGB surface.
 fn srgb_to_linear(u: u8) -> f32 {
     let c = u as f32 / 255.0;
@@ -235,11 +243,7 @@ impl Gpu {
         let font_family = font::resolve_family(&font_system);
         let base_size = font::resolved_size();
         let metrics = font::metrics(base_size * scale);
-        let fam = match &font_family {
-            Some(n) => Family::Name(n),
-            None => Family::Monospace,
-        };
-        let cell = font::measure_cell(&mut font_system, metrics, fam);
+        let cell = font::measure_cell(&mut font_system, metrics, family_of(&font_family));
         let mut text_buffer = Buffer::new(&mut font_system, metrics);
         text_buffer.set_wrap(&mut font_system, Wrap::None);
         // Metrics hinting (off by default) snaps glyphs to integer X; with a
@@ -277,10 +281,7 @@ impl Gpu {
         }
         self.scale = scale;
         self.metrics = font::metrics(self.base_size * scale);
-        let fam = match &self.font_family {
-            Some(n) => Family::Name(n),
-            None => Family::Monospace,
-        };
+        let fam = family_of(&self.font_family);
         self.cell = font::measure_cell(&mut self.font_system, self.metrics, fam);
         self.text_buffer.set_metrics(&mut self.font_system, self.metrics);
         self.text_buffer
@@ -312,11 +313,7 @@ impl Gpu {
             Some(self.config.width as f32),
             Some(self.metrics.line_height),
         );
-        let family = match &self.font_family {
-            Some(n) => Family::Name(n),
-            None => Family::Monospace,
-        };
-        let attrs = Attrs::new().family(family).color(color);
+        let attrs = Attrs::new().family(family_of(&self.font_family)).color(color);
         b.set_text(&mut self.font_system, text, &attrs, Shaping::Basic, None);
         b.shape_until_scroll(&mut self.font_system, false);
         b
@@ -364,11 +361,7 @@ impl Gpu {
         // scroll keeps the same rows and just repositions the buffer.
         let dims = (self.config.width, self.config.height);
         if body != self.last_body || dims != self.last_dims {
-            let family = match &self.font_family {
-                Some(n) => Family::Name(n),
-                None => Family::Monospace,
-            };
-            let ink_attrs = Attrs::new().family(family).color(color(INK));
+            let ink_attrs = Attrs::new().family(family_of(&self.font_family)).color(color(INK));
             self.text_buffer.set_size(&mut self.font_system, Some(w), Some(h));
             self.text_buffer
                 .set_text(&mut self.font_system, &body, &ink_attrs, Shaping::Basic, None);

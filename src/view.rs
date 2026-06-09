@@ -20,6 +20,27 @@ pub enum Row {
     Tilde,
 }
 
+/// Frame metadata — everything a front-end needs *except* the row contents,
+/// which it builds from [`Editor::row_at`](crate::editor::Editor)/`rows_at`. The
+/// terminal front-end uses [`Frame`] (rows included); the GUI uses this plus
+/// `rows_at` so it can render the rows around an in-progress scroll animation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FrameMeta {
+    /// First visible line and column (the settled scroll target).
+    pub top: usize,
+    pub left: usize,
+    /// Text-area height in rows (viewport minus the two chrome rows).
+    pub text_rows: usize,
+    pub status: String,
+    pub echo: String,
+    /// Cursor `(col, row)` in cells, viewport-relative.
+    pub cursor: (usize, usize),
+    /// LEAP match `(row, start_col, end_col)`, viewport-relative.
+    pub leap_hl: Option<(usize, usize, usize)>,
+    pub full_repaint: bool,
+    pub redraw_text: bool,
+}
+
 /// A complete, render-ready snapshot of the editor for one frame, in cells.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Frame {

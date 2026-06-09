@@ -18,7 +18,7 @@ use crate::input::{KeyChord, LogicalKey};
 use crate::leap::{Dir, Leap};
 use crate::statusline::StatusLine;
 use crate::store::Store;
-use crate::view::{Frame, Row};
+use crate::view::{Frame, FrameMeta, Row};
 
 /// Compact the append-only log into a snapshot once it grows past this many rows.
 const COMPACT_THRESHOLD: i64 = 2000;
@@ -113,21 +113,12 @@ impl Editor {
     pub fn shutdown(&mut self) -> Result<()> {
         self.persist_edits()?;
         if self.store.edit_count()? > COMPACT_THRESHOLD {
-            let text = self.buffer_text();
+            // Snapshot the *raw* text (markers/tabs/newlines intact) — display_line
+            // would strip markers and expand tabs, corrupting the workspace.
+            let text = self.buffer.text();
             self.store.snapshot(&text)?;
         }
         Ok(())
-    }
-
-    /// The full stream as a `String` (for snapshot compaction).
-    fn buffer_text(&self) -> String {
-        (0..self.buffer.len_lines())
-            .map(|l| {
-                let mut s = self.buffer.display_line(l, 0, usize::MAX);
-                s.push('\n');
-                s
-            })
-            .collect()
     }
 
     // --- input dispatch ---------------------------------------------------
@@ -503,30 +494,36 @@ impl Editor {
     /// (the bottom two rows are chrome). Also persists the resume position when
     /// it has moved. No drawing happens here — that's the front-end's job.
     pub fn compute_frame(&mut self, cols: usize, rows: usize) -> Result<Frame> {
+        let m = self.tick(cols, rows)?;
+        let rows = (0..m.text_rows)
+            .map(|r| self.row_at(m.top + r, m.left, cols))
+            .collect();
+        Ok(Frame {
+            rows,
+            status: m.status,
+            echo: m.echo,
+            cursor: m.cursor,
+            leap_hl: m.leap_hl,
+            full_repaint: m.full_repaint,
+            redraw_text: m.redraw_text,
+        })
+    }
+
+    /// Advance the view (scroll-to-cursor + persist resume state) and return the
+    /// frame *metadata* — everything except the row contents. Front-ends build
+    /// rows from this via [`row_at`](Self::row_at)/[`rows_at`](Self::rows_at), so
+    /// the row-construction logic lives in one place and the GUI doesn't build
+    /// rows twice. `cols`/`rows` are the viewport size in cells.
+    pub fn tick(&mut self, cols: usize, rows: usize) -> Result<FrameMeta> {
         let text_rows = rows.saturating_sub(2);
-        let text_cols = cols;
         self.last_text_rows = text_rows; // for page up/down
-        self.scroll_to_cursor(text_rows, text_cols);
+        self.scroll_to_cursor(text_rows, cols);
 
         // Persist the resume position whenever it moves (cheap single-row write).
         let st = (self.buffer.cursor(), self.top, self.left);
         if st != self.saved_state {
             self.store.set_state(st.0, st.1, st.2)?;
             self.saved_state = st;
-        }
-
-        // Visible text rows.
-        let mut out_rows = Vec::with_capacity(text_rows);
-        for row in 0..text_rows {
-            let idx = self.top + row;
-            let r = if idx >= self.buffer.len_lines() {
-                Row::Tilde
-            } else if self.buffer.line_is_marker(idx) {
-                Row::MarkerRule
-            } else {
-                Row::Text(self.buffer.display_line(idx, self.left, text_cols))
-            };
-            out_rows.push(r);
         }
 
         // LEAP highlight, translated to viewport-relative cells.
@@ -540,10 +537,10 @@ impl Editor {
             })
         });
 
-        let status = self.status_string(text_cols);
+        let status = self.status_string(cols);
         let echo: String = match &self.leap {
-            Some(l) => l.label().chars().take(text_cols).collect(),
-            None => self.echo.render(text_cols),
+            Some(l) => l.label().chars().take(cols).collect(),
+            None => self.echo.render(cols),
         };
 
         let (line, _) = self.buffer.cursor_line_col();
@@ -552,8 +549,10 @@ impl Editor {
             line.saturating_sub(self.top),
         );
 
-        Ok(Frame {
-            rows: out_rows,
+        Ok(FrameMeta {
+            top: self.top,
+            left: self.left,
+            text_rows,
             status,
             echo,
             cursor,
@@ -563,17 +562,16 @@ impl Editor {
         })
     }
 
-    /// Target vertical scroll (first visible line). The GUI eases its pixel
-    /// scroll toward this for smooth scrolling.
-    #[cfg(feature = "gui")]
-    pub fn view_top(&self) -> usize {
-        self.top
-    }
-
-    /// Horizontal scroll (first visible display column).
-    #[cfg(feature = "gui")]
-    pub fn view_left(&self) -> usize {
-        self.left
+    /// One display row at absolute line `idx`, scrolled by `left`, clipped to
+    /// `width`. The single source of row construction.
+    fn row_at(&self, idx: usize, left: usize, width: usize) -> Row {
+        if idx >= self.buffer.len_lines() {
+            Row::Tilde
+        } else if self.buffer.line_is_marker(idx) {
+            Row::MarkerRule
+        } else {
+            Row::Text(self.buffer.display_line(idx, left, width))
+        }
     }
 
     /// Whether the cursor is in the Canon Cat "wide" state (last action was
@@ -589,18 +587,7 @@ impl Editor {
     /// viewport.
     #[cfg(feature = "gui")]
     pub fn rows_at(&self, top: usize, count: usize, left: usize, width: usize) -> Vec<Row> {
-        (0..count)
-            .map(|i| {
-                let idx = top + i;
-                if idx >= self.buffer.len_lines() {
-                    Row::Tilde
-                } else if self.buffer.line_is_marker(idx) {
-                    Row::MarkerRule
-                } else {
-                    Row::Text(self.buffer.display_line(idx, left, width))
-                }
-            })
-            .collect()
+        (0..count).map(|i| self.row_at(top + i, left, width)).collect()
     }
 
     /// The current LEAP match as `(line, start_dcol, end_dcol)` in absolute
