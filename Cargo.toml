@@ -11,3 +11,29 @@ dirs = "6.0.0"
 ropey = "1.6.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 thiserror = "2.0.18"
+
+# --- GUI front-end (Wayland) — behind the `gui` feature ---------------------
+# wgpu is pinned to exactly the version glyphon depends on, so there is a single
+# wgpu in the tree. cosmic-text / fontdb come transitively via glyphon (use
+# glyphon::cosmic_text) and are added directly only when needed (font config).
+glyphon = { version = "0.11.0", optional = true }
+wgpu = { version = "29.0.3", optional = true }
+winit = { version = "0.30", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+arboard = { version = "3", optional = true }
+
+[features]
+default = []
+gui = ["dep:glyphon", "dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:arboard"]
+
+# The terminal binary (default build) — stays static-musl friendly.
+[[bin]]
+name = "leap"
+path = "src/main.rs"
+
+# The Wayland GUI binary — requires the `gui` feature (glibc-dynamic).
+[[bin]]
+name = "leap-gui"
+path = "src/bin/leap-gui.rs"
+required-features = ["gui"]

@@ -1,22 +1,14 @@
-//! leap — a modeless, LEAP-driven terminal text editor (Canon Cat edition).
+//! leap — the terminal binary (Canon Cat edition).
 //!
-//! See `docs/CANON_CAT.md` for this branch's fileless, database-backed design,
-//! and `docs/DESIGN.md` for the original architecture.
-
-mod buffer;
-mod echo;
-mod editor;
-mod leap;
-mod statusline;
-mod store;
-mod terminal;
-mod tutorial;
+//! Thin wrapper: parse the CLI, open the workspace, and hand off to the terminal
+//! front-end. All logic lives in the `leap` library crate (see `lib.rs`). The
+//! Wayland GUI is a separate binary (`leap-gui`, built with `--features gui`).
 
 use anyhow::Result;
 use clap::Parser;
 
-use crate::editor::Editor;
-use crate::store::{EditOp, Store};
+use leap::editor::Editor;
+use leap::{frontend, workspace};
 
 /// A modeless, LEAP-driven terminal text editor in the spirit of the Canon Cat.
 ///
@@ -28,29 +20,7 @@ struct Cli {}
 
 fn main() -> Result<()> {
     let _cli = Cli::parse();
-
-    // Open (or create) the single fixed workspace. `LEAP_WORKSPACE` overrides
-    // the path — undocumented, for tests so they never touch the real database.
-    let path = match std::env::var_os("LEAP_WORKSPACE") {
-        Some(p) => p.into(),
-        None => Store::default_path()?,
-    };
-    let mut store = Store::open(&path)?;
-
-    // First run: seed the empty workspace with the tutorial, as the Cat shipped
-    // its manual *inside* the workspace — ordinary text you can edit or delete.
-    if store.head() == 0 {
-        store.append(
-            &[EditOp::Insert {
-                pos: 0,
-                text: tutorial::TUTORIAL.to_string(),
-            }],
-            0,
-        )?;
-    }
-
-    // The terminal guard restores raw mode / alt screen on any exit (incl. panic).
-    let _guard = terminal::setup()?;
-    let mut editor = Editor::new(store)?;
-    editor.run()
+    let store = workspace::open()?;
+    let editor = Editor::new(store)?;
+    frontend::terminal::run(editor)
 }

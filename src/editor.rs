@@ -1,26 +1,24 @@
-//! Top-level editor state and the event loop.
+//! The UI-agnostic editor core: state, command dispatch, and the view model.
 //!
-//! Buffer + diff renderer + two-row chrome (status line and a **display-only**
-//! [`Echo`] line — no modal minibuffer). On the Canon Cat branch there are **no
-//! files**: the buffer is reconstructed from the SQLite [store](crate::store) on
-//! launch and every keystroke is persisted back, so the workspace resumes
-//! exactly where you left off. The text is one continuous stream divided into
-//! documents by boundary markers (`C-x [` / `C-x ]` to jump, `C-x C-n` for a new
-//! one). **LEAP** (`C-s`/`C-r`, see [`crate::leap`]) is incremental
-//! search-to-move. Because nothing is ever unsaved, `C-q` just quits.
-
-use std::io::{self, Write};
+//! On the Canon Cat branch there are **no files**: the buffer is reconstructed
+//! from the SQLite [store](crate::store) on launch and every keystroke is
+//! persisted back, so the workspace resumes exactly where you left off. The text
+//! is one continuous stream divided into documents by boundary markers. **LEAP**
+//! (`C-s`/`C-r`, see [`crate::leap`]) is incremental search-to-move.
+//!
+//! This module holds **no terminal or windowing types**. Front-ends feed it
+//! [`KeyChord`]s via [`Editor::input`] and render the [`Frame`] returned by
+//! [`Editor::compute_frame`]. See [`crate::frontend`].
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::{Attribute, Print, SetAttribute};
-use crossterm::{cursor, queue, terminal};
 
 use crate::buffer::Buffer;
 use crate::echo::Echo;
+use crate::input::{KeyChord, LogicalKey};
 use crate::leap::{Dir, Leap};
 use crate::statusline::StatusLine;
 use crate::store::Store;
+use crate::view::{Frame, Row};
 
 /// Compact the append-only log into a snapshot once it grows past this many rows.
 const COMPACT_THRESHOLD: i64 = 2000;
@@ -30,7 +28,7 @@ enum Prefix {
     CtrlX,
 }
 
-/// The running editor: document plus viewport, chrome, and loop state.
+/// The running editor: document plus viewport, chrome, and command state.
 pub struct Editor {
     buffer: Buffer,
     /// The persistent workspace; edits are appended here every keystroke.
@@ -50,19 +48,21 @@ pub struct Editor {
     prefix: Option<Prefix>,
     /// Active LEAP search session, if any.
     leap: Option<Leap>,
-    /// Kill ring (single register for now; becomes a ring + OSC 52 in M6).
+    /// Kill ring (single register for now; becomes a ring + OSC 52 later).
     kill_ring: String,
     /// Whether the previous command was a kill, so consecutive kills accumulate
     /// into one kill-ring entry (Emacs behaviour).
     last_was_kill: bool,
-    /// Height of the text area on the last render, for page up/down (`C-v`/`M-v`).
+    /// Height of the text area on the last computed frame, for page up/down.
     last_text_rows: usize,
-    /// Diff-render cache: the exact (full-width) string currently shown on each
-    /// screen row. A row is only re-emitted when its desired content differs,
-    /// so a pure cursor move repaints just the status line, not the whole screen.
-    frame: Vec<String>,
-    frame_cols: u16,
-    frame_rows: u16,
+    /// Whether the last action was typing a character — the Canon Cat "wide"
+    /// cursor state (solid highlight on the just-typed char + blinking cursor on
+    /// the next position). Cleared by any move/leap → "narrow" (single cursor).
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    wide: bool,
+    /// Set by commands that need the front-end to fully repaint (recenter, LEAP
+    /// land/cancel). Surfaced on the next [`Frame`] and then cleared.
+    force_repaint: bool,
 }
 
 impl Editor {
@@ -87,46 +87,34 @@ impl Editor {
             kill_ring: String::new(),
             last_was_kill: false,
             last_text_rows: 1,
-            frame: Vec::new(),
-            frame_cols: 0,
-            frame_rows: 0,
+            wide: false,
+            force_repaint: false,
         })
     }
 
-    /// Event loop: handle a key, flush its edits to the store, repaint. Blocking
-    /// reads — there is no animated gesture to keep alive (quitting is instant
-    /// because the workspace is always saved).
-    pub fn run(&mut self) -> Result<()> {
-        self.render()?;
-        while self.running {
-            match event::read()? {
-                Event::Key(key) => {
-                    self.on_key(key);
-                    self.persist_edits()?;
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
-            if self.running {
-                self.render()?;
-            }
-        }
-        // Clean exit: a final flush + log compaction so next launch is fast.
-        self.persist_edits()?;
-        if self.store.edit_count()? > COMPACT_THRESHOLD {
-            let text = self.buffer_text();
-            self.store.snapshot(&text)?;
-        }
-        Ok(())
+    /// Whether the editor wants to keep running (cleared by `C-q` / `C-x C-c`).
+    pub fn running(&self) -> bool {
+        self.running
     }
 
-    /// Drain the buffer's edit journal into the append-only log.
-    fn persist_edits(&mut self) -> Result<()> {
+    /// Drain the buffer's edit journal into the append-only log. Front-ends call
+    /// this after each [`input`](Self::input).
+    pub fn persist_edits(&mut self) -> Result<()> {
         let ops = self.buffer.take_journal();
         if !ops.is_empty() {
             self.store.append(&ops, self.group)?;
             self.group += 1;
             self.buffer.mark_saved();
+        }
+        Ok(())
+    }
+
+    /// Flush + compact on a clean exit so the next launch is fast.
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.persist_edits()?;
+        if self.store.edit_count()? > COMPACT_THRESHOLD {
+            let text = self.buffer_text();
+            self.store.snapshot(&text)?;
         }
         Ok(())
     }
@@ -142,97 +130,116 @@ impl Editor {
             .collect()
     }
 
-    fn on_key(&mut self, key: KeyEvent) {
-        // Key releases (Kitty protocol) carry no command on this branch.
-        if key.kind == KeyEventKind::Release {
-            return;
-        }
+    // --- input dispatch ---------------------------------------------------
 
+    /// Handle one logical key. Front-ends decode native events into a
+    /// [`KeyChord`] (filtering key releases) and call this.
+    pub fn input(&mut self, chord: KeyChord) {
+        // Default to the "narrow" cursor; the text-insertion arms below set it
+        // back to "wide". (Set before the early returns so leaping is narrow.)
+        self.wide = false;
         // A LEAP session is active: keystrokes drive the search, not the buffer.
         if self.leap.is_some() {
             self.last_was_kill = false;
-            self.leap_key(key);
+            self.leap_chord(chord);
             return;
         }
         // A prefix key is pending (e.g. C-x): this key completes it.
         if let Some(prefix) = self.prefix.take() {
             self.last_was_kill = false;
-            self.prefix_key(prefix, key);
+            self.prefix_chord(prefix, chord);
             return;
         }
         // Ordinary key: any previous echo message lasts only until now.
         self.echo.clear();
 
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let (ctrl, alt) = (chord.ctrl, chord.alt);
         // Consecutive kills accumulate; any other command breaks the run.
-        let is_kill = ctrl && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('w'));
+        let is_kill = ctrl && matches!(chord.key, LogicalKey::Char('k') | LogicalKey::Char('w'));
         if !is_kill {
             self.last_was_kill = false;
         }
 
-        match key.code {
+        match chord.key {
             // ---- quit / prefix / cancel ------------------------------------
-            KeyCode::Char('q') if ctrl => self.running = false,
-            KeyCode::Char('x') if ctrl => {
+            LogicalKey::Char('q') if ctrl => self.running = false,
+            LogicalKey::Char('x') if ctrl => {
                 self.prefix = Some(Prefix::CtrlX);
                 self.echo.show("C-x-");
             }
-            // C-g is Emacs keyboard-quit (abort).
-            KeyCode::Char('g') if ctrl => self.echo.show("Quit"),
+            LogicalKey::Char('g') if ctrl => self.echo.show("Quit"),
 
             // ---- LEAP (incremental search-to-move) -------------------------
-            KeyCode::Char('s') if ctrl => self.leap_start(Dir::Forward),
-            KeyCode::Char('r') if ctrl => self.leap_start(Dir::Backward),
+            LogicalKey::Char('s') if ctrl => self.leap_start(Dir::Forward),
+            LogicalKey::Char('r') if ctrl => self.leap_start(Dir::Backward),
 
             // ---- Emacs navigation (no arrows) ------------------------------
-            KeyCode::Char('b') if ctrl => self.buffer.move_left(),
-            KeyCode::Char('f') if ctrl => self.buffer.move_right(),
-            KeyCode::Char('p') if ctrl => self.buffer.move_up(),
-            KeyCode::Char('n') if ctrl => self.buffer.move_down(),
-            KeyCode::Char('a') if ctrl => self.buffer.move_home(),
-            KeyCode::Char('e') if ctrl => self.buffer.move_end(),
-            KeyCode::Char('b') if alt => self.buffer.move_word_backward(),
-            KeyCode::Char('f') if alt => self.buffer.move_word_forward(),
-            KeyCode::Char('v') if ctrl => self.page_down(),
-            KeyCode::Char('v') if alt => self.page_up(),
+            LogicalKey::Char('b') if ctrl => self.buffer.move_left(),
+            LogicalKey::Char('f') if ctrl => self.buffer.move_right(),
+            LogicalKey::Char('p') if ctrl => self.buffer.move_up(),
+            LogicalKey::Char('n') if ctrl => self.buffer.move_down(),
+            LogicalKey::Char('a') if ctrl => self.buffer.move_home(),
+            LogicalKey::Char('e') if ctrl => self.buffer.move_end(),
+            LogicalKey::Char('b') if alt => self.buffer.move_word_backward(),
+            LogicalKey::Char('f') if alt => self.buffer.move_word_forward(),
+            LogicalKey::Char('v') if ctrl => self.page_down(),
+            LogicalKey::Char('v') if alt => self.page_up(),
             // C-l: redraw and center the cursor's line (Emacs recenter).
-            KeyCode::Char('l') if ctrl => self.recenter(),
+            LogicalKey::Char('l') if ctrl => self.recenter(),
 
             // ---- Emacs editing ---------------------------------------------
-            KeyCode::Char('d') if ctrl => self.edit(Buffer::delete_forward),
-            KeyCode::Char('h') if ctrl => self.edit(Buffer::backspace),
-            KeyCode::Char('k') if ctrl => self.kill(Buffer::kill_line, false),
-            KeyCode::Char('w') if ctrl => self.kill(Buffer::backward_kill_word, true),
-            KeyCode::Char('y') if ctrl => self.yank(),
+            LogicalKey::Char('d') if ctrl => self.edit(Buffer::delete_forward),
+            LogicalKey::Char('h') if ctrl => self.edit(Buffer::backspace),
+            LogicalKey::Char('k') if ctrl => self.kill(Buffer::kill_line, false),
+            LogicalKey::Char('w') if ctrl => self.kill(Buffer::backward_kill_word, true),
+            LogicalKey::Char('y') if ctrl => {
+                self.wide = true;
+                self.yank();
+            }
 
             // ---- arrows & named keys ---------------------------------------
-            KeyCode::Left => self.buffer.move_left(),
-            KeyCode::Right => self.buffer.move_right(),
-            KeyCode::Up => self.buffer.move_up(),
-            KeyCode::Down => self.buffer.move_down(),
-            KeyCode::Home => self.buffer.move_home(),
-            KeyCode::End => self.buffer.move_end(),
+            LogicalKey::Left => self.buffer.move_left(),
+            LogicalKey::Right => self.buffer.move_right(),
+            LogicalKey::Up => self.buffer.move_up(),
+            LogicalKey::Down => self.buffer.move_down(),
+            LogicalKey::Home => self.buffer.move_home(),
+            LogicalKey::End => self.buffer.move_end(),
 
             // ---- right-thumb cluster: page, or jump documents with Ctrl -----
-            KeyCode::PageUp if ctrl => self.prev_document(),
-            KeyCode::PageDown if ctrl => self.next_document(),
-            KeyCode::PageUp => self.page_up(),
-            KeyCode::PageDown => self.page_down(),
+            LogicalKey::PageUp if ctrl => self.prev_document(),
+            LogicalKey::PageDown if ctrl => self.next_document(),
+            LogicalKey::PageUp => self.page_up(),
+            LogicalKey::PageDown => self.page_down(),
 
             // M-Enter starts a new document (must precede the plain Enter arm).
-            KeyCode::Enter if alt => {
+            LogicalKey::Enter if alt => {
+                self.wide = true;
                 self.edit(Buffer::insert_document_break);
                 self.echo.show("New document");
             }
-            KeyCode::Enter => self.edit(Buffer::insert_newline),
-            KeyCode::Tab => self.edit(|b| b.insert_char('\t')),
-            KeyCode::Backspace => self.edit(Buffer::backspace),
-            KeyCode::Delete => self.edit(Buffer::delete_forward),
-            // Plain text input (Shift for uppercase is fine; Ctrl/Alt are reserved).
-            KeyCode::Char(c) if !ctrl && !alt => self.edit(move |b| b.insert_char(c)),
+            LogicalKey::Enter => {
+                self.wide = true;
+                self.edit(Buffer::insert_newline);
+            }
+            LogicalKey::Tab => {
+                self.wide = true;
+                self.edit(|b| b.insert_char('\t'));
+            }
+            LogicalKey::Backspace => self.edit(Buffer::backspace),
+            LogicalKey::Delete => self.edit(Buffer::delete_forward),
+            // Plain text input (Shift for uppercase is fine; Ctrl/Alt reserved).
+            LogicalKey::Char(c) if !ctrl && !alt => {
+                self.wide = true;
+                self.edit(move |b| b.insert_char(c));
+            }
             _ => {}
         }
+    }
+
+    /// Insert a committed string at the cursor (used by GUI IME commits).
+    pub fn insert_text(&mut self, s: &str) {
+        self.wide = true;
+        self.buffer.insert_str(s);
     }
 
     /// Run a kill command: capture the removed text and add it to the kill ring,
@@ -259,6 +266,17 @@ impl Editor {
         }
     }
 
+    /// The current kill-ring contents (for clipboard sync in the GUI).
+    pub fn kill_ring(&self) -> &str {
+        &self.kill_ring
+    }
+
+    /// Replace the kill ring (e.g. from the system clipboard before a yank).
+    pub fn set_kill_ring(&mut self, text: String) {
+        self.kill_ring = text;
+        self.last_was_kill = false;
+    }
+
     /// `C-v` / `M-v`: move the cursor a near-screenful down/up.
     fn page_down(&mut self) {
         for _ in 0..self.page_step() {
@@ -277,13 +295,11 @@ impl Editor {
     }
 
     /// `C-l`: scroll so the cursor's line sits in the middle of the text area,
-    /// and force a full repaint (clears any terminal glitches). Like Emacs
-    /// `recenter`. `scroll_to_cursor` leaves `top` alone since the cursor is now
-    /// comfortably on screen.
+    /// and force a full repaint (clears any glitches). Like Emacs `recenter`.
     fn recenter(&mut self) {
         let (line, _) = self.buffer.cursor_line_col();
         self.top = line.saturating_sub(self.last_text_rows / 2);
-        self.frame_cols = 0; // invalidate the diff cache → clear-and-repaint
+        self.force_repaint = true;
     }
 
     /// Run a mutating edit on the buffer.
@@ -292,18 +308,18 @@ impl Editor {
     }
 
     /// Complete a pending prefix key (currently only `C-x`).
-    fn prefix_key(&mut self, prefix: Prefix, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    fn prefix_chord(&mut self, prefix: Prefix, chord: KeyChord) {
+        let ctrl = chord.ctrl;
         match prefix {
-            Prefix::CtrlX => match key.code {
+            Prefix::CtrlX => match chord.key {
                 // Document jumps mirror C-p / C-n; brackets avoided (deep layer
                 // on the Ergodox). Single-chord equivalents are Ctrl+PgUp/PgDn.
-                KeyCode::Char('p') => self.prev_document(),
-                KeyCode::Char('n') => self.next_document(),
+                LogicalKey::Char('p') => self.prev_document(),
+                LogicalKey::Char('n') => self.next_document(),
                 // C-x C-c: quit (everything is already saved).
-                KeyCode::Char('c') if ctrl => self.running = false,
-                KeyCode::Char('g') if ctrl => self.echo.show("Cancelled"),
-                KeyCode::Esc => self.echo.show("Cancelled"),
+                LogicalKey::Char('c') if ctrl => self.running = false,
+                LogicalKey::Char('g') if ctrl => self.echo.show("Cancelled"),
+                LogicalKey::Esc => self.echo.show("Cancelled"),
                 _ => self.echo.show("C-x: undefined key"),
             },
         }
@@ -352,23 +368,22 @@ impl Editor {
     }
 
     /// A keystroke while a LEAP session is active.
-    fn leap_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        match key.code {
-            KeyCode::Char('s') if ctrl => self.leap_repeat(Dir::Forward),
-            KeyCode::Char('r') if ctrl => self.leap_repeat(Dir::Backward),
-            KeyCode::Enter => self.leap_land(),
-            KeyCode::Esc => self.leap_cancel(),
-            KeyCode::Char('g') if ctrl => self.leap_cancel(),
-            KeyCode::Backspace => self.leap_backspace(),
-            KeyCode::Char('h') if ctrl => self.leap_backspace(),
-            KeyCode::Char(c) if !ctrl && !alt => self.leap_input(c),
+    fn leap_chord(&mut self, chord: KeyChord) {
+        let (ctrl, alt) = (chord.ctrl, chord.alt);
+        match chord.key {
+            LogicalKey::Char('s') if ctrl => self.leap_repeat(Dir::Forward),
+            LogicalKey::Char('r') if ctrl => self.leap_repeat(Dir::Backward),
+            LogicalKey::Enter => self.leap_land(),
+            LogicalKey::Esc => self.leap_cancel(),
+            LogicalKey::Char('g') if ctrl => self.leap_cancel(),
+            LogicalKey::Backspace => self.leap_backspace(),
+            LogicalKey::Char('h') if ctrl => self.leap_backspace(),
+            LogicalKey::Char(c) if !ctrl && !alt => self.leap_input(c),
             // Any other key lands the session and is then handled normally, so
             // LEAP is never a trap (C-q quits, arrows move, etc.).
             _ => {
                 self.leap_land();
-                self.on_key(key);
+                self.input(chord);
             }
         }
     }
@@ -453,7 +468,7 @@ impl Editor {
     /// Land the session, keeping the cursor at the match.
     fn leap_land(&mut self) {
         self.leap = None;
-        self.frame_cols = 0; // clear the match highlight on the next repaint
+        self.force_repaint = true; // clear the match highlight on the next repaint
     }
 
     /// Abandon the session, returning the cursor to where it started.
@@ -461,9 +476,11 @@ impl Editor {
         if let Some(l) = self.leap.take() {
             self.buffer.set_cursor(l.origin);
         }
-        self.frame_cols = 0;
+        self.force_repaint = true;
         self.echo.show("Quit");
     }
+
+    // --- view ---------------------------------------------------------------
 
     /// Adjust the viewport so the cursor stays on screen.
     fn scroll_to_cursor(&mut self, text_rows: usize, text_cols: usize) {
@@ -482,13 +499,12 @@ impl Editor {
         }
     }
 
-    fn render(&mut self) -> Result<()> {
-        let (cols, rows) = terminal::size()?;
-        // Bottom two rows are chrome: status line, then the echo line.
-        let text_rows = rows.saturating_sub(2) as usize;
-        let text_cols = cols as usize;
-        let status_row = rows.saturating_sub(2);
-        let mini_row = rows.saturating_sub(1);
+    /// Produce a render-ready [`Frame`] for a viewport of `cols`×`rows` cells
+    /// (the bottom two rows are chrome). Also persists the resume position when
+    /// it has moved. No drawing happens here — that's the front-end's job.
+    pub fn compute_frame(&mut self, cols: usize, rows: usize) -> Result<Frame> {
+        let text_rows = rows.saturating_sub(2);
+        let text_cols = cols;
         self.last_text_rows = text_rows; // for page up/down
         self.scroll_to_cursor(text_rows, text_cols);
 
@@ -499,75 +515,96 @@ impl Editor {
             self.saved_state = st;
         }
 
-        let mut out = io::stdout();
-
-        // On first frame or resize, drop the cache and clear the screen once;
-        // every row then differs from its (empty) cache and is repainted.
-        if self.frame_cols != cols || self.frame_rows != rows {
-            self.frame = vec![String::new(); rows as usize];
-            self.frame_cols = cols;
-            self.frame_rows = rows;
-            queue!(out, terminal::Clear(terminal::ClearType::All))?;
-        }
-
-        queue!(out, terminal::BeginSynchronizedUpdate, cursor::Hide)?;
-
-        // The LEAP match to highlight this frame: (line, start_dcol, end_dcol).
-        let leap_hl = self.leap_highlight();
-        // While leaping we draw the text rows directly (with highlight), so drop
-        // their cache to force a clean repaint that also clears a stale match.
-        if leap_hl.is_some() || self.leap.is_some() {
-            for row in 0..text_rows {
-                self.frame[row] = String::new();
-            }
-        }
-
-        // Text area: only repaint rows whose content changed (or all, leaping).
+        // Visible text rows.
+        let mut out_rows = Vec::with_capacity(text_rows);
         for row in 0..text_rows {
             let idx = self.top + row;
-            let desired = if idx >= self.buffer.len_lines() {
-                "~".to_string()
+            let r = if idx >= self.buffer.len_lines() {
+                Row::Tilde
             } else if self.buffer.line_is_marker(idx) {
-                marker_rule(text_cols)
+                Row::MarkerRule
             } else {
-                self.buffer.display_line(idx, self.left, text_cols)
+                Row::Text(self.buffer.display_line(idx, self.left, text_cols))
             };
-            match leap_hl {
-                Some((line, lo, hi)) if line == idx => {
-                    self.draw_row_highlight(&mut out, row as u16, &desired, lo, hi, text_cols)?;
-                }
-                _ => self.draw_row(&mut out, row as u16, desired, text_cols, false)?,
-            }
+            out_rows.push(r);
         }
 
-        // Status line (reverse video); changes on most cursor moves.
-        let status = self.status_string(text_cols);
-        self.draw_row(&mut out, status_row, status, text_cols, true)?;
+        // LEAP highlight, translated to viewport-relative cells.
+        let leap_hl = self.leap_highlight().and_then(|(line, lo, hi)| {
+            (line >= self.top && line < self.top + text_rows).then(|| {
+                (
+                    line - self.top,
+                    lo.saturating_sub(self.left),
+                    hi.saturating_sub(self.left),
+                )
+            })
+        });
 
-        // Echo line. Priority: LEAP label > transient message.
-        let echo_line = match &self.leap {
+        let status = self.status_string(text_cols);
+        let echo: String = match &self.leap {
             Some(l) => l.label().chars().take(text_cols).collect(),
             None => self.echo.render(text_cols),
         };
-        self.draw_row(&mut out, mini_row, echo_line, text_cols, false)?;
 
-        // Park the hardware cursor at the buffer cursor. Repositioning never
-        // clears, so it can't flicker.
         let (line, _) = self.buffer.cursor_line_col();
-        let cursor_col = (self.buffer.cursor_display_col() - self.left) as u16;
-        let cursor_row = (line - self.top) as u16;
-        queue!(
-            out,
-            cursor::MoveTo(cursor_col, cursor_row),
-            cursor::Show,
-            terminal::EndSynchronizedUpdate,
-        )?;
-        out.flush()?;
-        Ok(())
+        let cursor = (
+            self.buffer.cursor_display_col().saturating_sub(self.left),
+            line.saturating_sub(self.top),
+        );
+
+        Ok(Frame {
+            rows: out_rows,
+            status,
+            echo,
+            cursor,
+            leap_hl,
+            full_repaint: std::mem::take(&mut self.force_repaint),
+            redraw_text: self.leap.is_some(),
+        })
+    }
+
+    /// Target vertical scroll (first visible line). The GUI eases its pixel
+    /// scroll toward this for smooth scrolling.
+    #[cfg(feature = "gui")]
+    pub fn view_top(&self) -> usize {
+        self.top
+    }
+
+    /// Horizontal scroll (first visible display column).
+    #[cfg(feature = "gui")]
+    pub fn view_left(&self) -> usize {
+        self.left
+    }
+
+    /// Whether the cursor is in the Canon Cat "wide" state (last action was
+    /// typing → show the solid erase highlight on the previous char). `false`
+    /// after a move/leap → "narrow" single blinking cursor.
+    #[cfg(feature = "gui")]
+    pub fn cursor_wide(&self) -> bool {
+        self.wide
+    }
+
+    /// Render an arbitrary row window `[top, top + count)` — lets the GUI draw
+    /// the rows around an in-progress scroll animation, not just the settled
+    /// viewport.
+    #[cfg(feature = "gui")]
+    pub fn rows_at(&self, top: usize, count: usize, left: usize, width: usize) -> Vec<Row> {
+        (0..count)
+            .map(|i| {
+                let idx = top + i;
+                if idx >= self.buffer.len_lines() {
+                    Row::Tilde
+                } else if self.buffer.line_is_marker(idx) {
+                    Row::MarkerRule
+                } else {
+                    Row::Text(self.buffer.display_line(idx, left, width))
+                }
+            })
+            .collect()
     }
 
     /// The current LEAP match as `(line, start_dcol, end_dcol)` in absolute
-    /// display columns, or `None` when not leaping / no match.
+    /// display columns, or `None` when not leaping / no match / multi-line.
     fn leap_highlight(&self) -> Option<(usize, usize, usize)> {
         let l = self.leap.as_ref()?;
         let m = l.matched?;
@@ -575,67 +612,6 @@ impl Editor {
         let (line, start) = self.buffer.line_col_at(m);
         let (end_line, end) = self.buffer.line_col_at(m + qlen);
         (end_line == line).then_some((line, start, end))
-    }
-
-    /// Draw a text row with the LEAP match highlighted (reverse video over the
-    /// display columns `[start_dcol, end_dcol)`). Always repaints.
-    fn draw_row_highlight(
-        &mut self,
-        out: &mut impl Write,
-        row: u16,
-        desired: &str,
-        start_dcol: usize,
-        end_dcol: usize,
-        width: usize,
-    ) -> Result<()> {
-        queue!(out, cursor::MoveTo(0, row))?;
-        let mut drawn = 0;
-        for (i, c) in desired.chars().take(width).enumerate() {
-            let dcol = self.left + i;
-            if dcol >= start_dcol && dcol < end_dcol {
-                queue!(out, SetAttribute(Attribute::Reverse), Print(c), SetAttribute(Attribute::Reset))?;
-            } else {
-                queue!(out, Print(c))?;
-            }
-            drawn += 1;
-        }
-        for _ in drawn..width {
-            queue!(out, Print(' '))?;
-        }
-        self.frame[row as usize] = String::new(); // force redraw next frame
-        Ok(())
-    }
-
-    /// Repaint screen row `row` only if `desired` (padded to the full width)
-    /// differs from what the cache says is already there. `reverse` selects the
-    /// inverted attribute used for the status line.
-    fn draw_row(
-        &mut self,
-        out: &mut impl Write,
-        row: u16,
-        desired: String,
-        width: usize,
-        reverse: bool,
-    ) -> Result<()> {
-        // Pad to full width so a shorter new line fully overwrites the old one
-        // in a single write — no Clear, hence no blank flash.
-        let mut line = desired;
-        let len = line.chars().count();
-        if len < width {
-            line.extend(std::iter::repeat_n(' ', width - len));
-        }
-
-        if self.frame[row as usize] == line {
-            return Ok(());
-        }
-        queue!(out, cursor::MoveTo(0, row))?;
-        if reverse {
-            queue!(out, SetAttribute(Attribute::Reverse), Print(&line), SetAttribute(Attribute::Reset))?;
-        } else {
-            queue!(out, Print(&line))?;
-        }
-        self.frame[row as usize] = line;
-        Ok(())
     }
 
     fn status_string(&self, width: usize) -> String {
@@ -661,7 +637,76 @@ impl Editor {
     }
 }
 
-/// A full-width horizontal rule drawn in place of a document-boundary marker line.
-fn marker_rule(width: usize) -> String {
-    "─".repeat(width)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::Row;
+
+    /// An editor over a fresh in-memory workspace seeded with `text`.
+    fn editor_with(text: &str) -> Editor {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .append(&[crate::store::EditOp::Insert { pos: 0, text: text.into() }], 0)
+            .unwrap();
+        Editor::new(store).unwrap()
+    }
+
+    fn ctrl(c: char) -> KeyChord {
+        KeyChord::ctrl(c)
+    }
+    fn ch(c: char) -> KeyChord {
+        KeyChord::plain(LogicalKey::Char(c))
+    }
+
+    #[test]
+    fn typing_inserts_and_persists() {
+        let mut e = editor_with("");
+        for c in "hi".chars() {
+            e.input(ch(c));
+        }
+        e.persist_edits().unwrap();
+        // Reconstruct from the store: the edits were appended.
+        assert_eq!(e.store.resume().unwrap().text, "hi");
+    }
+
+    #[test]
+    fn ctrl_q_stops_running() {
+        let mut e = editor_with("x");
+        assert!(e.running());
+        e.input(ctrl('q'));
+        assert!(!e.running());
+    }
+
+    #[test]
+    fn leap_forward_moves_cursor_to_match() {
+        let mut e = editor_with("alpha beta gamma");
+        e.input(ctrl('s')); // start LEAP forward
+        for c in "beta".chars() {
+            e.input(ch(c));
+        }
+        e.input(KeyChord::plain(LogicalKey::Enter)); // land
+        assert_eq!(e.buffer.cursor(), 6); // "beta" starts at char 6
+    }
+
+    #[test]
+    fn compute_frame_lays_out_rows_status_and_cursor() {
+        let mut e = editor_with("one\ntwo\nthree");
+        // 5 rows total → 3 text rows + status + echo.
+        let f = e.compute_frame(20, 5).unwrap();
+        assert_eq!(f.rows.len(), 3);
+        assert_eq!(f.rows[0], Row::Text("one".into()));
+        assert_eq!(f.rows[1], Row::Text("two".into()));
+        assert!(f.status.contains("Ln 1"));
+        assert_eq!(f.cursor, (0, 0));
+    }
+
+    #[test]
+    fn compute_frame_marks_marker_and_tilde_rows() {
+        let mut e = editor_with("a\n\u{1e}\nb"); // line 1 is a document marker
+        let f = e.compute_frame(20, 10).unwrap();
+        assert_eq!(f.rows[0], Row::Text("a".into()));
+        assert_eq!(f.rows[1], Row::MarkerRule);
+        assert_eq!(f.rows[2], Row::Text("b".into()));
+        assert_eq!(f.rows[3], Row::Tilde); // past end of buffer
+    }
 }
